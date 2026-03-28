@@ -37,17 +37,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
-CLUSTER_MIN_WALLETS = 5                # default min wallets (overridden by token age)
-CLUSTER_TIME_WINDOW_HOURS = 2          # rolling window for clustering
-SPEED_WINDOW_MINUTES = 4               # window for speed bonus scoring
-POLL_INTERVAL_SECONDS = 30
-MIN_BUY_VALUE_USD = 50                 # placeholder
-TOKEN_MAX_AGE_DAYS = 1                 # ignore tokens launched more than this many days ago
-
-# Dynamic alert thresholds — lower bar for brand new tokens so we catch launches fast
-NEW_TOKEN_HOURS = 1    # token < 1h old → alert at 2 fresh wallets
-HOT_TOKEN_HOURS = 6    # token < 6h old → alert at 3 fresh wallets
-                       # token >= 6h     → standard CLUSTER_MIN_WALLETS (5)
+CLUSTER_MIN_WALLETS = 5                # fresh/dormant wallets needed to alert
+CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
+POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
+TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -167,23 +160,6 @@ solana_program_last_sig: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
-
-def dynamic_min_wallets(token_age_hours: float | None) -> int:
-    """
-    Lower the alert threshold for newly launched tokens so we fire fast.
-      < 1h  → 2 wallets  (catch launches the moment they happen)
-      < 6h  → 3 wallets
-      >= 6h → CLUSTER_MIN_WALLETS (5, the normal threshold)
-    Unknown age (DexScreener lookup failed) uses the normal threshold.
-    """
-    if token_age_hours is None:
-        return CLUSTER_MIN_WALLETS
-    if token_age_hours <= NEW_TOKEN_HOURS:
-        return 2
-    if token_age_hours <= HOT_TOKEN_HOURS:
-        return 3
-    return CLUSTER_MIN_WALLETS
-
 
 def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count: int) -> tuple[int, str]:
     """
@@ -388,11 +364,11 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
 
 
 def is_token_too_old(token_address: str, network: str = "solana") -> bool:
-    """Returns True if the token launched more than TOKEN_MAX_AGE_DAYS ago."""
+    """Returns True if the token launched more than TOKEN_MAX_AGE_HOURS ago."""
     age = get_token_age_hours(token_address, network)
     if age is None:
         return False  # unknown age → allow through rather than silently drop
-    return age > TOKEN_MAX_AGE_DAYS * 24
+    return age > TOKEN_MAX_AGE_HOURS
 
 
 # ---------------------------------------------------------------------------
@@ -436,14 +412,8 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
 
-    # Speed: how many wallets bought within first SPEED_WINDOW_MINUTES
-    if buys:
-        earliest_ts = min(b["timestamp"] for b in buys)
-        speed_cutoff = earliest_ts + SPEED_WINDOW_MINUTES * 60
-        speed_count = sum(1 for b in buys if b["timestamp"] <= speed_cutoff)
-    else:
-        speed_count = 0
-
+    # All buys are already within CLUSTER_TIME_WINDOW_MINUTES by definition
+    speed_count = len(buys)
     score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
 
     # Wallet lines — fresh first, then dormant
@@ -472,7 +442,7 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
     summary = " + ".join(summary_parts)
 
-    speed_str = f"{speed_count} wallets in first {SPEED_WINDOW_MINUTES}min" if speed_count > 1 else ""
+    speed_str = f"{speed_count} wallets in {CLUSTER_TIME_WINDOW_MINUTES}min" if speed_count > 1 else ""
     if token_age_hours is not None:
         if token_age_hours < 1:
             age_str = f"{int(token_age_hours * 60)}min old 🔴"
@@ -502,7 +472,7 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
 
 
 def prune_old_buys(chain_id: str) -> None:
-    cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_HOURS * 3600
+    cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_MINUTES * 60
     buys = cluster_buys[chain_id]
     for token in list(buys.keys()):
         buys[token] = [b for b in buys[token] if b["timestamp"] >= cutoff]
@@ -519,12 +489,10 @@ def check_for_clusters(chain_id: str) -> None:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
 
-        # Use dynamic threshold — lower bar for brand new tokens
-        token_age = get_token_age_hours(token_address, network)
-        min_wallets = dynamic_min_wallets(token_age)
-        if len(unique_buys) < min_wallets:
+        if len(unique_buys) < CLUSTER_MIN_WALLETS:
             continue
 
+        token_age = get_token_age_hours(token_address, network)
         if is_token_too_old(token_address, network):
             log.debug("[%s] Skipping old token %s", chain_id, token_address[:10])
             continue
@@ -824,13 +792,7 @@ def build_solana_alert(token_address: str, buys: list[dict]) -> str:
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
 
-    if buys:
-        earliest_ts = min(b["timestamp"] for b in buys)
-        speed_cutoff = earliest_ts + SPEED_WINDOW_MINUTES * 60
-        speed_count = sum(1 for b in buys if b["timestamp"] <= speed_cutoff)
-    else:
-        speed_count = 0
-
+    speed_count = len(buys)  # all buys are within the 10-min window
     score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
 
     wallet_lines = []
@@ -856,7 +818,7 @@ def build_solana_alert(token_address: str, buys: list[dict]) -> str:
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
     summary = " + ".join(summary_parts)
 
-    speed_str = f"{speed_count} wallets in first {SPEED_WINDOW_MINUTES}min" if speed_count > 1 else ""
+    speed_str = f"{speed_count} wallets in {CLUSTER_TIME_WINDOW_MINUTES}min" if speed_count > 1 else ""
 
     return (
         f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}\n\n"
@@ -897,11 +859,10 @@ def check_solana_clusters() -> None:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
 
-        token_age = get_token_age_hours(token_address, "solana")
-        min_wallets = dynamic_min_wallets(token_age)
-        if len(unique_buys) < min_wallets:
+        if len(unique_buys) < CLUSTER_MIN_WALLETS:
             continue
 
+        token_age = get_token_age_hours(token_address, "solana")
         if is_token_too_old(token_address, "solana"):
             log.debug("[solana] Skipping old token %s", token_address[:10])
             continue
@@ -999,7 +960,7 @@ def process_helius_swaps(txs: list[dict], program_id: str) -> int:
 
 
 def prune_solana_old_buys() -> None:
-    cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_HOURS * 3600
+    cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_MINUTES * 60
     buys = cluster_buys["solana"]
     for token in list(buys.keys()):
         buys[token] = [b for b in buys[token] if b["timestamp"] >= cutoff]
