@@ -1,8 +1,11 @@
 """
-PiggyBac — Multi-chain fresh-wallet buy detector.
-Monitors Base and Ethereum mainnet for coordinated buying by freshly-funded
-wallets. When 5+ wallets created/funded in the last 24 hours all buy the same
-token within a 2-hour window, fires a Telegram alert.
+PiggyBac — Multi-chain fresh-wallet + dormant-wallet buy detector.
+Monitors Base and Ethereum mainnet for coordinated buying by:
+  - Fresh wallets: created/funded in the last 24h
+  - Dormant wallets: last active 6+ months ago, now suddenly buying
+
+Signal is scored and tiered. Mixed fresh+dormant clusters are flagged as
+the strongest signal.
 """
 
 import os
@@ -31,17 +34,16 @@ API_KEY = os.getenv("BASESCAN_API_KEY", "")  # works for both Etherscan + Basesc
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-FRESH_WALLET_MAX_AGE_HOURS = 24
-CLUSTER_MIN_WALLETS = 5
-CLUSTER_TIME_WINDOW_HOURS = 2
+FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
+DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
+CLUSTER_MIN_WALLETS = 5                # min wallets (fresh+dormant) to alert
+CLUSTER_TIME_WINDOW_HOURS = 2          # rolling window for clustering
+SPEED_WINDOW_MINUTES = 4               # window for speed bonus scoring
 POLL_INTERVAL_SECONDS = 30
-MIN_BUY_VALUE_USD = 50  # placeholder — used once ETH price is wired up
+MIN_BUY_VALUE_USD = 50                 # placeholder
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-)
-UNISWAP_V3_SWAP_TOPIC = (
-    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 )
 
 # ---------------------------------------------------------------------------
@@ -99,12 +101,12 @@ CHAINS = {
 # ---------------------------------------------------------------------------
 
 # chain_id -> token_address -> list of buy dicts
-fresh_wallet_buys: dict[str, dict[str, list[dict]]] = {
+cluster_buys: dict[str, dict[str, list[dict]]] = {
     chain: defaultdict(list) for chain in CHAINS
 }
 
-# chain_id -> wallet_address -> first_tx_timestamp
-wallet_age_cache: dict[str, dict[str, int]] = {chain: {} for chain in CHAINS}
+# chain_id -> wallet_address -> {first_ts, last_ts}
+wallet_cache: dict[str, dict[str, dict]] = {chain: {} for chain in CHAINS}
 
 # chain_id -> token_address -> {name, symbol}
 token_info_cache: dict[str, dict[str, dict]] = {chain: {} for chain in CHAINS}
@@ -114,6 +116,38 @@ alerted_clusters: set[str] = set()
 
 # chain_id -> last block processed
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count: int) -> tuple[int, str]:
+    """
+    Returns (score, tier_emoji).
+    Tier:
+      🔥    — basic signal (5+ wallets, mostly fresh)
+      🔥🔥  — strong signal (10+ wallets OR mixed fresh+dormant)
+      🔥🔥🔥 — massive cook (20+ wallets OR heavy mix)
+    """
+    score = total
+
+    # Mixed fresh+dormant is the strongest signal
+    if fresh_count > 0 and dormant_count > 0:
+        score += dormant_count * 3  # dormant wallets weighted heavily
+
+    # Speed bonus — many wallets in first few minutes
+    if speed_count >= 3:
+        score += speed_count * 2
+
+    if total >= 20 or (fresh_count > 0 and dormant_count >= 3):
+        tier = "🔥🔥🔥"
+    elif total >= 10 or (fresh_count > 0 and dormant_count > 0):
+        tier = "🔥🔥"
+    else:
+        tier = "🔥"
+
+    return score, tier
+
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -161,27 +195,57 @@ def get_erc20_transfers(chain_id: str, from_block: int, to_block: int) -> list[d
     return data.get("result", []) if data else []
 
 
-def get_wallet_first_tx_timestamp(chain_id: str, address: str) -> int | None:
-    cache = wallet_age_cache[chain_id]
+def get_wallet_timestamps(chain_id: str, address: str) -> dict | None:
+    """
+    Returns {first_ts, last_ts} for a wallet. Cached.
+    Makes two API calls (first tx asc, last tx desc).
+    """
+    cache = wallet_cache[chain_id]
     if address in cache:
         return cache[address]
-    data = chain_get(
-        chain_id,
-        {
-            "module": "account",
-            "action": "txlist",
-            "address": address,
-            "startblock": 0,
-            "endblock": 99999999,
-            "page": 1,
-            "offset": 1,
-            "sort": "asc",
-        },
-    )
-    if data and data.get("result"):
-        ts = int(data["result"][0]["timeStamp"])
-        cache[address] = ts
-        return ts
+
+    base_params = {
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": 0,
+        "endblock": 99999999,
+        "page": 1,
+        "offset": 1,
+    }
+
+    first_data = chain_get(chain_id, {**base_params, "sort": "asc"})
+    last_data = chain_get(chain_id, {**base_params, "sort": "desc"})
+
+    if not first_data or not first_data.get("result"):
+        return None
+
+    first_ts = int(first_data["result"][0]["timeStamp"])
+    last_ts = int(last_data["result"][0]["timeStamp"]) if last_data and last_data.get("result") else first_ts
+
+    result = {"first_ts": first_ts, "last_ts": last_ts}
+    cache[address] = result
+    return result
+
+
+def classify_wallet(chain_id: str, address: str) -> str | None:
+    """
+    Returns 'fresh', 'dormant', or None (not interesting).
+    - fresh: first tx <24h ago
+    - dormant: last tx >180 days ago, but now active again
+    """
+    ts = get_wallet_timestamps(chain_id, address)
+    if not ts:
+        return None
+
+    now = NOW_TS()
+    age_hours = (now - ts["first_ts"]) / 3600
+    inactive_days = (now - ts["last_ts"]) / 86400
+
+    if age_hours <= FRESH_WALLET_MAX_AGE_HOURS:
+        return "fresh"
+    if inactive_days >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
+        return "dormant"
     return None
 
 
@@ -258,26 +322,54 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict]) -> str:
         f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}"
     )
 
+    fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
+    dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
+
+    # Speed: how many wallets bought within first SPEED_WINDOW_MINUTES
+    if buys:
+        earliest_ts = min(b["timestamp"] for b in buys)
+        speed_cutoff = earliest_ts + SPEED_WINDOW_MINUTES * 60
+        speed_count = sum(1 for b in buys if b["timestamp"] <= speed_cutoff)
+    else:
+        speed_count = 0
+
+    score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
+
+    # Wallet lines — fresh first, then dormant
     wallet_lines = []
-    for b in buys:
-        wallet = b["wallet"]
-        short_w = wallet[:6] + "..." + wallet[-4:]
+    for b in fresh_buys:
+        short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
         funding = b.get("funding_source") or "unknown"
         tx_url = f"{chain['explorer_url']}/tx/{b['tx_hash']}"
-        wallet_lines.append(
-            f"  • <a href='{tx_url}'>{short_w}</a> (funded via {funding})"
-        )
+        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> (funded via {funding})")
+
+    for b in dormant_buys:
+        short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
+        tx_url = f"{chain['explorer_url']}/tx/{b['tx_hash']}"
+        inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
+        wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
 
     wallets_str = "\n".join(wallet_lines)
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     chain_label = chain["name"]
 
+    # Summary line
+    summary_parts = []
+    if fresh_buys:
+        summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
+    if dormant_buys:
+        summary_parts.append(f"{len(dormant_buys)} dormant 💤")
+    summary = " + ".join(summary_parts)
+
+    speed_str = f"{speed_count} wallets in first {SPEED_WINDOW_MINUTES}min" if speed_count > 1 else ""
+
     return (
-        f"🐷 <b>PiggyBac Alert</b> [{chain_label}] — {ts}\n\n"
+        f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}\n\n"
         f"<b>Token:</b> {token_name} ({token_symbol})\n"
         f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
-        f"<b>Fresh wallets buying:</b> {len(buys)}\n\n"
-        f"{wallets_str}\n\n"
+        f"<b>Wallets:</b> {summary}\n"
+        + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
+        + f"\n{wallets_str}\n\n"
         f"<a href='{dexscreener_url}'>DexScreener</a> | "
         f"<a href='{explorer_url}'>Explorer</a>"
     )
@@ -288,17 +380,9 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def is_fresh_wallet(chain_id: str, wallet: str) -> bool:
-    first_ts = get_wallet_first_tx_timestamp(chain_id, wallet)
-    if first_ts is None:
-        return False
-    age_hours = (NOW_TS() - first_ts) / 3600
-    return age_hours <= FRESH_WALLET_MAX_AGE_HOURS
-
-
 def prune_old_buys(chain_id: str) -> None:
     cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_HOURS * 3600
-    buys = fresh_wallet_buys[chain_id]
+    buys = cluster_buys[chain_id]
     for token in list(buys.keys()):
         buys[token] = [b for b in buys[token] if b["timestamp"] >= cutoff]
         if not buys[token]:
@@ -306,26 +390,29 @@ def prune_old_buys(chain_id: str) -> None:
 
 
 def check_for_clusters(chain_id: str) -> None:
-    for token_address, buys in fresh_wallet_buys[chain_id].items():
+    for token_address, buys in cluster_buys[chain_id].items():
         if len(buys) < CLUSTER_MIN_WALLETS:
             continue
+        # Deduplicate by wallet
         seen = {}
         for b in buys:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
         if len(unique_buys) < CLUSTER_MIN_WALLETS:
             continue
+
         cluster_key = chain_id + token_address + str(
             sorted(b["wallet"] for b in unique_buys)
         )
         if cluster_key in alerted_clusters:
             continue
         alerted_clusters.add(cluster_key)
+
+        fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
+        dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
         log.info(
-            "[%s] CLUSTER: %s fresh wallets bought %s",
-            chain_id,
-            len(unique_buys),
-            token_address,
+            "[%s] CLUSTER: %d fresh + %d dormant wallets bought %s",
+            chain_id, fresh_count, dormant_count, token_address,
         )
         message = build_alert(chain_id, token_address, unique_buys)
         send_telegram(message)
@@ -349,22 +436,30 @@ def process_transfers(chain_id: str, transfers: list[dict]) -> None:
         if to_addr.lower() in dex_routers_lower:
             continue
 
-        if not is_fresh_wallet(chain_id, to_addr):
-            continue
+        wallet_type = classify_wallet(chain_id, to_addr)
+        if wallet_type is None:
+            continue  # not fresh or dormant — skip
 
-        funding_source = get_wallet_funding_source(chain_id, to_addr)
+        funding_source = None
+        last_ts = now
+        ts_data = wallet_cache[chain_id].get(to_addr)
+        if ts_data:
+            last_ts = ts_data["last_ts"]
+
+        if wallet_type == "fresh":
+            funding_source = get_wallet_funding_source(chain_id, to_addr)
 
         log.info(
-            "[%s] Fresh wallet buy: wallet=%s token=%s",
-            chain_id,
-            to_addr[:10],
-            token_address[:10],
+            "[%s] %s wallet buy: wallet=%s token=%s",
+            chain_id, wallet_type, to_addr[:10], token_address[:10],
         )
 
-        fresh_wallet_buys[chain_id][token_address].append(
+        cluster_buys[chain_id][token_address].append(
             {
                 "wallet": to_addr,
+                "wallet_type": wallet_type,
                 "timestamp": block_ts,
+                "last_ts": last_ts,
                 "tx_hash": tx_hash,
                 "funding_source": funding_source,
                 "estimated_eth": 0.01,  # placeholder — P0 fix
