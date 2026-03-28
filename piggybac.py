@@ -48,6 +48,21 @@ ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 )
 
+# Uniswap V3 Swap(address indexed sender, address indexed recipient, ...)
+UNISWAP_V3_SWAP_TOPIC = (
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+)
+# Uniswap V2 Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)
+UNISWAP_V2_SWAP_TOPIC = (
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+)
+
+# WETH address per chain (the token we treat as "native" — buying it = selling, not buying)
+WETH_ADDRESSES = {
+    "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    "base":     "0x4200000000000000000000000000000000000006",
+}
+
 # ---------------------------------------------------------------------------
 # Solana config
 # ---------------------------------------------------------------------------
@@ -154,6 +169,9 @@ cluster_buys: dict[str, dict[str, list[dict]]] = {
     chain: defaultdict(list) for chain in ALL_CHAIN_IDS
 }
 
+# chain_id -> pool_address -> (token0, token1) — populated via eth_call
+pool_tokens_cache: dict[str, dict[str, tuple]] = {chain: {} for chain in CHAINS}
+
 # chain_id -> wallet_address -> {first_ts, last_ts}
 wallet_cache: dict[str, dict[str, dict]] = {chain: {} for chain in ALL_CHAIN_IDS}
 
@@ -249,24 +267,117 @@ def get_latest_block(chain_id: str) -> int:
 MAX_BLOCKS_PER_SCAN = 5  # keeps eth_getLogs result set small on high-throughput chains like Base
 
 
-def get_erc20_transfers(chain_id: str, from_block: int, to_block: int) -> list[dict]:
+def get_swap_logs(chain_id: str, from_block: int, to_block: int) -> list[dict]:
     """
-    Fetch ERC-20 Transfer logs for a block range via Alchemy eth_getLogs.
+    Fetch Uniswap V2 + V3 Swap event logs for a block range.
     Chunked to MAX_BLOCKS_PER_SCAN to stay within Alchemy result limits.
+    Each returned log is tagged with '_swap_version': 'v2' or 'v3'.
     """
     all_results = []
     chunk_start = from_block
     while chunk_start <= to_block:
         chunk_end = min(chunk_start + MAX_BLOCKS_PER_SCAN - 1, to_block)
-        result = alchemy_rpc(chain_id, "eth_getLogs", [{
-            "fromBlock": hex(chunk_start),
-            "toBlock": hex(chunk_end),
-            "topics": [ERC20_TRANSFER_TOPIC],
-        }])
-        if isinstance(result, list):
-            all_results.extend(result)
+        for version, topic in [("v3", UNISWAP_V3_SWAP_TOPIC), ("v2", UNISWAP_V2_SWAP_TOPIC)]:
+            result = alchemy_rpc(chain_id, "eth_getLogs", [{
+                "fromBlock": hex(chunk_start),
+                "toBlock": hex(chunk_end),
+                "topics": [topic],
+            }])
+            if isinstance(result, list):
+                for log in result:
+                    log["_swap_version"] = version
+                all_results.extend(result)
         chunk_start = chunk_end + 1
     return all_results
+
+
+def get_pool_tokens(chain_id: str, pool_address: str) -> tuple[str, str] | None:
+    """
+    Returns (token0, token1) for a Uniswap V2/V3 pool via eth_call.
+    Both use the same token0()/token1() ABI so one helper covers both.
+    Results are cached to avoid repeated calls for the same pool.
+    """
+    cache = pool_tokens_cache[chain_id]
+    addr = pool_address.lower()
+    if addr in cache:
+        return cache[addr]
+
+    def call_selector(selector: str) -> str | None:
+        result = alchemy_rpc(chain_id, "eth_call", [
+            {"to": pool_address, "data": selector}, "latest"
+        ])
+        # Returns 32-byte ABI-encoded address: "0x" + 24 zero chars + 40 hex chars
+        if result and len(result) == 66:
+            return "0x" + result[26:].lower()
+        return None
+
+    t0 = call_selector("0x0dfe1681")  # token0()
+    t1 = call_selector("0xd21220a7")  # token1()
+    if t0 and t1:
+        cache[addr] = (t0, t1)
+        return (t0, t1)
+    return None
+
+
+def _to_int256(raw: int) -> int:
+    """Convert a 256-bit unsigned integer to signed int256 (two's complement)."""
+    return raw - (1 << 256) if raw >= (1 << 255) else raw
+
+
+def decode_swap_log(chain_id: str, log: dict) -> tuple[str, str] | None:
+    """
+    Decode a Uniswap V2 or V3 Swap log.
+    Returns (recipient_address, token_bought_address) or None if undecidable.
+    Filters out swaps where the user is buying WETH (i.e., selling a token).
+    """
+    topics = log.get("topics", [])
+    if len(topics) < 3:
+        return None
+
+    # topics[2] is the recipient (indexed) for both V2 and V3
+    recipient = "0x" + topics[2][-40:].lower()
+    pool_address = log.get("address", "")
+    tokens = get_pool_tokens(chain_id, pool_address)
+    if not tokens:
+        return None
+    token0, token1 = tokens
+    weth = WETH_ADDRESSES.get(chain_id, "")
+
+    data = log.get("data", "")
+    version = log.get("_swap_version", "v3")
+
+    if version == "v3":
+        # data = amount0 (int256 32B) + amount1 (int256 32B) + ...
+        if len(data) < 130:  # "0x" + 128 hex chars
+            return None
+        amount0 = _to_int256(int(data[2:66], 16))
+        amount1 = _to_int256(int(data[66:130], 16))
+        # Negative amount = tokens flowed OUT of pool = user received (bought) that token
+        if amount0 < 0:
+            bought = token0
+        elif amount1 < 0:
+            bought = token1
+        else:
+            return None
+
+    else:  # v2
+        # data = amount0In + amount1In + amount0Out + amount1Out (uint256 x4)
+        if len(data) < 258:  # "0x" + 256 hex chars
+            return None
+        amount0_out = int(data[130:194], 16)
+        amount1_out = int(data[194:258], 16)
+        if amount0_out > 0:
+            bought = token0
+        elif amount1_out > 0:
+            bought = token1
+        else:
+            return None
+
+    # Skip if the bought token is WETH — that means the user is selling, not buying
+    if bought.lower() == weth.lower():
+        return None
+
+    return (recipient, bought)
 
 
 def _alchemy_asset_transfers(chain_id: str, direction: str, address: str, order: str = "asc") -> list[dict]:
@@ -573,53 +684,48 @@ def check_for_clusters(chain_id: str) -> None:
         send_telegram(message)
 
 
-def process_transfers(chain_id: str, transfers: list[dict]) -> None:
+def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
+    """
+    Process Uniswap V2/V3 Swap logs: decode each swap, check if the buyer
+    is a fresh/dormant wallet, and record it for cluster detection.
+    """
     now = NOW_TS()
-    dex_routers_lower = {k.lower() for k in CHAINS[chain_id]["dex_routers"]}
 
-    for tx in transfers:
-        topics = tx.get("topics", [])
-        if len(topics) < 3:
+    for swap_log in swap_logs:
+        decoded = decode_swap_log(chain_id, swap_log)
+        if not decoded:
             continue
 
-        to_addr = "0x" + topics[2][-40:]
-        token_address = tx.get("address", "").lower()
-        tx_hash = tx.get("transactionHash", "")
-        raw_ts = tx.get("timeStamp", str(now))
-        block_ts = int(raw_ts, 16) if raw_ts.startswith("0x") else int(raw_ts)
+        wallet, token_address = decoded
+        tx_hash = swap_log.get("transactionHash", "")
 
-        if to_addr.lower() in dex_routers_lower:
-            continue
-
-        wallet_type = classify_wallet(chain_id, to_addr)
+        wallet_type = classify_wallet(chain_id, wallet)
         if wallet_type is None:
-            continue  # not fresh or dormant — skip
+            continue
 
-        funding_source = None
         last_ts = now
-        ts_data = wallet_cache[chain_id].get(to_addr)
+        ts_data = wallet_cache[chain_id].get(wallet)
         if ts_data:
             last_ts = ts_data["last_ts"]
 
+        funding_source = None
         if wallet_type == "fresh":
-            funding_source = get_wallet_funding_source(chain_id, to_addr)
+            funding_source = get_wallet_funding_source(chain_id, wallet)
 
+        version = swap_log.get("_swap_version", "")
         log.info(
-            "[%s] %s wallet buy: wallet=%s token=%s",
-            chain_id, wallet_type, to_addr[:10], token_address[:10],
+            "[%s] %s wallet buy (uni%s): wallet=%s token=%s",
+            chain_id, wallet_type, version, wallet[:10], token_address[:10],
         )
 
-        cluster_buys[chain_id][token_address].append(
-            {
-                "wallet": to_addr,
-                "wallet_type": wallet_type,
-                "timestamp": block_ts,
-                "last_ts": last_ts,
-                "tx_hash": tx_hash,
-                "funding_source": funding_source,
-                "estimated_eth": 0.01,  # placeholder — P0 fix
-            }
-        )
+        cluster_buys[chain_id][token_address].append({
+            "wallet": wallet,
+            "wallet_type": wallet_type,
+            "timestamp": now,
+            "last_ts": last_ts,
+            "tx_hash": tx_hash,
+            "funding_source": funding_source,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -1100,12 +1206,12 @@ def scan_chain(chain_id: str) -> None:
                 last_block_checked[chain_id] + 1,
                 current_block,
             )
-            transfers = get_erc20_transfers(
+            swap_logs = get_swap_logs(
                 chain_id, last_block_checked[chain_id] + 1, current_block
             )
-            log.info("[%s] Got %d transfer events", chain["name"], len(transfers))
+            log.info("[%s] Got %d swap events (V2+V3)", chain["name"], len(swap_logs))
 
-            process_transfers(chain_id, transfers)
+            process_swap_logs(chain_id, swap_logs)
             prune_old_buys(chain_id)
             check_for_clusters(chain_id)
 
