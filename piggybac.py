@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()
-SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "").strip().strip('"\'')
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip().strip('"\'')
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -51,8 +51,8 @@ ERC20_TRANSFER_TOPIC = (
 # Solana config
 # ---------------------------------------------------------------------------
 
-SOLSCAN_BASE_URL = "https://pro-api.solscan.io/v2.0"
-SOLANA_POLL_INTERVAL_SECONDS = 30
+HELIUS_API_URL = "https://api.helius.xyz/v0"
+HELIUS_RPC_URL = "https://mainnet.helius-rpc.com"  # api-key appended at call time
 
 # Known Solana DEX program IDs
 SOLANA_DEX_PROGRAMS = {
@@ -152,8 +152,8 @@ alerted_clusters: set[str] = set()
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
 
-# Solana: last seen transaction signature to avoid re-processing
-solana_last_seen_sig: str = ""
+# Solana: last seen tx signature per DEX program to avoid re-processing
+solana_program_last_sig: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -506,156 +506,102 @@ def process_transfers(chain_id: str, transfers: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Solana — Solscan v2 API helpers
+# Solana — Helius API helpers
 # ---------------------------------------------------------------------------
 
-SOLSCAN_HEADERS = {}
 
-
-def _init_solscan_headers() -> None:
-    global SOLSCAN_HEADERS
-    SOLSCAN_HEADERS = {"token": SOLSCAN_API_KEY}
-
-
-def solscan_get(endpoint: str, params: dict | None = None) -> dict | None:
-    """GET request to Solscan Pro v2 API."""
-    if not SOLSCAN_HEADERS:
-        _init_solscan_headers()
-    url = f"{SOLSCAN_BASE_URL}{endpoint}"
+def helius_get(endpoint: str, params: dict | None = None) -> list | dict | None:
+    """GET request to Helius Enhanced Transactions API."""
+    url = f"{HELIUS_API_URL}{endpoint}"
+    p = {"api-key": HELIUS_API_KEY}
+    if params:
+        p.update(params)
     try:
-        r = requests.get(url, params=params or {}, headers=SOLSCAN_HEADERS, timeout=15)
+        r = requests.get(url, params=p, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        if data.get("success") is True or "data" in data:
-            return data
-        log.debug("[solana] Solscan non-success: %s", data)
-        return data  # return anyway, some endpoints don't have 'success'
+        return r.json()
     except Exception as exc:
-        log.warning("[solana] Solscan request failed: %s %s", endpoint, exc)
+        log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
         return None
 
 
-def solscan_get_account_transfers(account: str, page: int = 1, page_size: int = 20) -> list[dict]:
-    """Get recent token transfers for a Solana account."""
-    data = solscan_get(
-        f"/account/transfer",
-        params={
-            "address": account,
-            "page": page,
-            "page_size": page_size,
-            "exclude_amount_zero": "true",
-        },
-    )
-    if data and "data" in data:
-        return data["data"] if isinstance(data["data"], list) else []
+def helius_rpc(method: str, params: list) -> object:
+    """JSON-RPC call via Helius RPC endpoint."""
+    try:
+        r = requests.post(
+            HELIUS_RPC_URL,
+            params={"api-key": HELIUS_API_KEY},
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json().get("result")
+    except Exception as exc:
+        log.warning("[solana] Helius RPC %s failed: %s", method, exc)
+        return None
+
+
+def helius_get_recent_swaps(program_id: str, until_sig: str = "") -> list[dict]:
+    """
+    Get recent SWAP transactions for a Solana DEX program via Helius
+    Enhanced Transactions API. Returns newest-first list.
+    `until_sig` stops fetching at (exclusive) this signature — used to
+    retrieve only transactions newer than the last poll.
+    """
+    params: dict = {"type": "SWAP", "limit": 100}
+    if until_sig:
+        params["until"] = until_sig
+    data = helius_get(f"/addresses/{program_id}/transactions", params=params)
+    if isinstance(data, list):
+        return data
     return []
 
 
-def solscan_get_defi_activities(page: int = 1, page_size: int = 100) -> list[dict]:
+def helius_get_wallet_timestamps(address: str) -> dict | None:
     """
-    Get recent Solana DEX swap activities by querying /token/defi/activities for WSOL.
-    Nearly every Solana token swap involves WSOL on one side, so this acts as
-    a broad feed of all DEX swap activity. We pass platform[] to filter to our
-    known DEX programs (Raydium, Orca, Jupiter, Pump.fun).
+    Returns {first_ts, last_ts} for a Solana wallet using Helius RPC
+    getSignaturesForAddress. Cached.
 
-    The (non-existent) global /defi/activities endpoint has been replaced with
-    /token/defi/activities?address=WSOL, which is the correct v2 approach.
-    """
-    # Build platform[] params as a list of (key, value) tuples so requests
-    # sends multiple values for the same key name.
-    params = [
-        ("address", WSOL_MINT),
-        ("activity_type[]", "ACTIVITY_TOKEN_SWAP"),
-        ("activity_type[]", "ACTIVITY_AGG_TOKEN_SWAP"),
-        ("page", page),
-        ("page_size", page_size),
-        ("sort_by", "block_time"),
-        ("sort_order", "desc"),
-    ]
-    for program_id in SOLANA_DEX_PROGRAMS:
-        params.append(("platform[]", program_id))
-
-    url = f"{SOLSCAN_BASE_URL}/token/defi/activities"
-    try:
-        r = requests.get(url, params=params, headers=SOLSCAN_HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        log.warning("[solana] Solscan /token/defi/activities failed: %s", exc)
-        return []
-
-    if not data or "data" not in data:
-        log.debug("[solana] No data in response: %s", data)
-        return []
-
-    activities = data["data"] if isinstance(data["data"], list) else []
-    log.debug("[solana] Got %d swap activities from /token/defi/activities", len(activities))
-    return activities
-
-
-def solscan_get_wallet_first_last_tx(address: str) -> dict | None:
-    """
-    Get first and last transaction timestamps for a Solana wallet.
-    Uses the /account/transactions endpoint. Cached.
+    Strategy:
+    - Fetch up to 1000 signatures (newest → oldest).
+    - last_ts  = blockTime of the first (newest) signature.
+    - first_ts = blockTime of the last  (oldest) in the batch.
+    - If the batch is < 1000 entries we have the full history → first_ts
+      is truly the wallet's first-ever transaction.
+    - If the batch is 1000 entries the wallet is old/active; first_ts is
+      a lower-bound approximation sufficient for dormant detection.
     """
     cache = wallet_cache["solana"]
     if address in cache:
         return cache[address]
 
-    # Get earliest transaction
-    first_data = solscan_get(
-        "/account/transactions",
-        params={
-            "address": address,
-            "page": 1,
-            "page_size": 1,
-            "sort_by": "block_time",
-            "sort_order": "asc",
-        },
-    )
-    # Get latest transaction
-    last_data = solscan_get(
-        "/account/transactions",
-        params={
-            "address": address,
-            "page": 1,
-            "page_size": 1,
-            "sort_by": "block_time",
-            "sort_order": "desc",
-        },
-    )
-
-    first_ts = None
-    last_ts = None
-
-    if first_data and "data" in first_data:
-        items = first_data["data"] if isinstance(first_data["data"], list) else []
-        if items:
-            first_ts = items[0].get("block_time") or items[0].get("blockTime")
-    if last_data and "data" in last_data:
-        items = last_data["data"] if isinstance(last_data["data"], list) else []
-        if items:
-            last_ts = items[0].get("block_time") or items[0].get("blockTime")
-
-    if first_ts is None:
+    sigs = helius_rpc("getSignaturesForAddress", [address, {"limit": 1000}])
+    if not sigs or not isinstance(sigs, list):
         return None
 
-    result = {"first_ts": int(first_ts), "last_ts": int(last_ts or first_ts)}
+    last_ts = sigs[0].get("blockTime") if sigs else None
+    first_ts = sigs[-1].get("blockTime") if sigs else last_ts
+
+    if last_ts is None:
+        return None
+
+    result = {"first_ts": int(first_ts or last_ts), "last_ts": int(last_ts), "tx_count": len(sigs)}
     cache[address] = result
     return result
 
 
 def classify_solana_wallet(address: str) -> str | None:
-    """Classify a Solana wallet as fresh, dormant, or uninteresting."""
-    ts = solscan_get_wallet_first_last_tx(address)
+    """Classify a Solana wallet as 'fresh', 'dormant', or None."""
+    ts = helius_get_wallet_timestamps(address)
     if not ts:
         return None
 
     now = NOW_TS()
+    # Fresh: wallet has < 1000 total txs AND oldest known tx is < 24h
     age_hours = (now - ts["first_ts"]) / 3600
     inactive_days = (now - ts["last_ts"]) / 86400
 
-    if age_hours <= FRESH_WALLET_MAX_AGE_HOURS:
+    if ts["tx_count"] < 1000 and age_hours <= FRESH_WALLET_MAX_AGE_HOURS:
         return "fresh"
     if inactive_days >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
         return "dormant"
@@ -663,30 +609,52 @@ def classify_solana_wallet(address: str) -> str | None:
 
 
 def get_solana_funding_source(address: str) -> str | None:
-    """Check first few transfers to see if wallet was funded by a known CEX."""
-    transfers = solscan_get_account_transfers(address, page=1, page_size=5)
-    for tx in transfers:
-        sender = tx.get("from_address") or tx.get("src") or ""
-        for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
-            if sender == known_addr:
-                return label
+    """Check earliest transactions to see if wallet was funded by a known CEX."""
+    # Get the oldest transactions (reverse the newest-first list)
+    sigs = helius_rpc("getSignaturesForAddress", [address, {"limit": 10}])
+    if not sigs:
+        return None
+    # Fetch enhanced tx details for the earliest signatures
+    oldest_sigs = [s["signature"] for s in reversed(sigs)][:5]
+    for sig in oldest_sigs:
+        data = helius_get(f"/transactions", params={"transactions": sig})
+        txs = data if isinstance(data, list) else []
+        for tx in txs:
+            for transfer in tx.get("nativeTransfers", []):
+                sender = transfer.get("fromUserAccount", "")
+                for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
+                    if sender == known_addr:
+                        return label
     return None
 
 
 def get_solana_token_info(token_mint: str) -> dict:
-    """Fetch token name/symbol from Solscan. Cached."""
+    """Fetch token name/symbol via Helius token-metadata endpoint. Cached."""
     cache = token_info_cache["solana"]
     if token_mint in cache:
         return cache[token_mint]
 
-    data = solscan_get(f"/token/meta", params={"address": token_mint})
-    if data and "data" in data:
-        meta = data["data"]
-        info = {
-            "name": meta.get("name") or "Unknown",
-            "symbol": meta.get("symbol") or "???",
-        }
-    else:
+    try:
+        r = requests.post(
+            f"{HELIUS_API_URL}/token-metadata",
+            params={"api-key": HELIUS_API_KEY},
+            json={"mintAccounts": [token_mint]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        results = r.json()
+        if results and isinstance(results, list):
+            meta = results[0]
+            # Try on-chain metadata first, fall back to legacy
+            on_chain = (meta.get("onChainMetadata") or {}).get("metadata", {}).get("data", {})
+            legacy = meta.get("legacyMetadata") or {}
+            name = on_chain.get("name") or legacy.get("name") or "Unknown"
+            symbol = on_chain.get("symbol") or legacy.get("symbol") or "???"
+            info = {"name": name.strip("\x00"), "symbol": symbol.strip("\x00")}
+        else:
+            info = {"name": "Unknown", "symbol": "???"}
+    except Exception as exc:
+        log.debug("[solana] Token metadata fetch failed for %s: %s", token_mint[:10], exc)
         info = {"name": "Unknown", "symbol": "???"}
 
     cache[token_mint] = info
@@ -780,93 +748,77 @@ def check_solana_clusters() -> None:
         send_telegram(message)
 
 
-def process_solana_swaps(activities: list[dict]) -> None:
-    """Process Solana DEX swap activities, classify wallets, record buys."""
-    global solana_last_seen_sig
+def process_helius_swaps(txs: list[dict], program_id: str) -> int:
+    """
+    Process a batch of Helius enhanced SWAP transactions for one DEX program.
+    Extracts wallet + token-bought, classifies wallet, records into cluster_buys.
+    Returns count of new swaps processed.
+    """
     now = NOW_TS()
-    new_last_sig = solana_last_seen_sig
+    dex_label = SOLANA_DEX_PROGRAMS.get(program_id, program_id[:10])
     processed = 0
 
-    for act in activities:
-        tx_hash = act.get("trans_id") or act.get("tx_hash") or ""
+    for tx in txs:
+        tx_hash = tx.get("signature") or ""
         if not tx_hash:
             continue
 
-        # Skip if we've already seen this
-        if tx_hash == solana_last_seen_sig:
-            break
-
-        if processed == 0:
-            new_last_sig = tx_hash
-
-        block_time = act.get("block_time") or act.get("blockTime") or now
-
-        # Extract the signer/wallet
-        wallet = act.get("from_address") or act.get("signer") or ""
+        block_time = tx.get("timestamp") or now
+        wallet = tx.get("feePayer") or ""
         if not wallet:
             continue
 
-        # Extract tokens involved — look for the token being bought (not SOL/WSOL)
-        # Activity format varies; handle token1/token2 or routed_token fields
+        # Find the token being bought: look in tokenTransfers for a transfer
+        # TO the feePayer that is not WSOL (i.e. the token received in the swap).
         token_bought = None
+        for transfer in tx.get("tokenTransfers", []):
+            mint = transfer.get("mint") or ""
+            if transfer.get("toUserAccount") == wallet and mint and mint != WSOL_MINT:
+                token_bought = mint
+                break
 
-        # Try structured token fields
-        token1 = act.get("token1") or ""
-        token2 = act.get("token2") or ""
-        # In a swap, one side is usually SOL/WSOL — the other is the token bought
-        if token1 and token1 != WSOL_MINT:
-            token_bought = token1
-        elif token2 and token2 != WSOL_MINT:
-            token_bought = token2
-
-        # Try routed format
+        # Fall back to swap event outputs if tokenTransfers didn't resolve it
         if not token_bought:
-            routed = act.get("routed_token") or act.get("token_address") or ""
-            if routed and routed != WSOL_MINT:
-                token_bought = routed
+            swap_event = (tx.get("events") or {}).get("swap") or {}
+            for out in swap_event.get("tokenOutputs", []):
+                mint = out.get("mint") or ""
+                if mint and mint != WSOL_MINT:
+                    token_bought = mint
+                    break
 
         if not token_bought:
             continue
 
-        # Classify the wallet
         wallet_type = classify_solana_wallet(wallet)
         if wallet_type is None:
             processed += 1
             continue
 
-        funding_source = None
         last_ts = now
         ts_data = wallet_cache["solana"].get(wallet)
         if ts_data:
             last_ts = ts_data["last_ts"]
 
+        funding_source = None
         if wallet_type == "fresh":
             funding_source = get_solana_funding_source(wallet)
-
-        dex_label = ""
-        platform = act.get("platform") or act.get("program_id") or ""
-        if platform in SOLANA_DEX_PROGRAMS:
-            dex_label = SOLANA_DEX_PROGRAMS[platform]
 
         log.info(
             "[solana] %s wallet buy: wallet=%s token=%s dex=%s",
             wallet_type, wallet[:10], token_bought[:10], dex_label,
         )
 
-        cluster_buys["solana"][token_bought].append(
-            {
-                "wallet": wallet,
-                "wallet_type": wallet_type,
-                "timestamp": int(block_time),
-                "last_ts": last_ts,
-                "tx_hash": tx_hash,
-                "funding_source": funding_source,
-                "dex": dex_label,
-            }
-        )
+        cluster_buys["solana"][token_bought].append({
+            "wallet": wallet,
+            "wallet_type": wallet_type,
+            "timestamp": int(block_time),
+            "last_ts": last_ts,
+            "tx_hash": tx_hash,
+            "funding_source": funding_source,
+            "dex": dex_label,
+        })
         processed += 1
 
-    solana_last_seen_sig = new_last_sig
     return processed
 
 
@@ -879,62 +831,47 @@ def prune_solana_old_buys() -> None:
             del buys[token]
 
 
-def _solscan_auth_probe() -> str:
-    """
-    Test auth against the cheapest Solscan endpoint (/account/transactions
-    for a known public address). Returns 'ok', 'auth_fail', or 'error'.
-    """
-    # Raydium AMM program — public, high activity, good test subject
-    test_addr = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-    try:
-        r = requests.get(
-            f"{SOLSCAN_BASE_URL}/account/transactions",
-            params={"address": test_addr, "page": 1, "page_size": 1},
-            headers=SOLSCAN_HEADERS,
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return "ok"
-        if r.status_code == 401:
-            return "auth_fail"
-        return f"http_{r.status_code}"
-    except Exception as exc:
-        return f"error:{exc}"
-
-
 def scan_solana() -> None:
-    """Main Solana scanner loop — polls Solscan /token/defi/activities for WSOL swaps."""
-    key_preview = (SOLSCAN_API_KEY[:8] + "..." + SOLSCAN_API_KEY[-4:]) if len(SOLSCAN_API_KEY) > 12 else f"(len={len(SOLSCAN_API_KEY)})"
-    log.info("[Solana] Starting up... API key preview: %s", key_preview)
-    _init_solscan_headers()
+    """
+    Main Solana scanner loop.
+    Polls each DEX program via Helius Enhanced Transactions API for recent
+    SWAP transactions. Uses per-program cursor (until_sig) to fetch only
+    new transactions since the last poll.
+    """
+    key_preview = (HELIUS_API_KEY[:8] + "..." + HELIUS_API_KEY[-4:]) if len(HELIUS_API_KEY) > 12 else f"(len={len(HELIUS_API_KEY)})"
+    log.info("[Solana] Starting up via Helius... key: %s", key_preview)
 
-    probe = _solscan_auth_probe()
-    if probe == "ok":
-        log.info("[Solana] Auth probe OK — API key is valid")
-    elif probe == "auth_fail":
-        log.error(
-            "[Solana] Auth probe FAILED (401) — API key is invalid or expired. "
-            "Check your Solscan Pro account at https://pro-api.solscan.io"
-        )
+    # Quick auth check
+    test = helius_rpc("getSlot", [])
+    if test is None:
+        log.error("[Solana] Helius auth/connectivity check failed — check HELIUS_API_KEY")
         return
-    else:
-        log.warning("[Solana] Auth probe result: %s — proceeding anyway", probe)
+    log.info("[Solana] Helius connected (slot %s). Monitoring %d DEX programs.", test, len(SOLANA_DEX_PROGRAMS))
 
     while True:
+        total_new = 0
         try:
-            activities = solscan_get_defi_activities(page=1, page_size=100)
-            log.info("[Solana] Got %d swap activities from DEXes", len(activities))
+            for program_id, dex_name in SOLANA_DEX_PROGRAMS.items():
+                until_sig = solana_program_last_sig.get(program_id, "")
+                txs = helius_get_recent_swaps(program_id, until_sig=until_sig)
 
-            count = process_solana_swaps(activities)
-            log.info("[Solana] Processed %d new swaps", count or 0)
+                if txs:
+                    # Record newest sig so next poll fetches only newer txs
+                    solana_program_last_sig[program_id] = txs[0].get("signature", until_sig)
+                    count = process_helius_swaps(txs, program_id)
+                    total_new += count
+                    log.debug("[solana] %s: %d swaps, %d new wallets of interest", dex_name, len(txs), count)
 
+                time.sleep(0.5)  # gentle rate-limit between programs
+
+            log.info("[Solana] Poll complete — %d fresh/dormant swaps across all DEXes", total_new)
             prune_solana_old_buys()
             check_solana_clusters()
 
         except Exception as exc:
             log.error("[solana] Error: %s", exc, exc_info=True)
 
-        time.sleep(SOLANA_POLL_INTERVAL_SECONDS)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -997,16 +934,16 @@ def main() -> None:
         log.warning("BASESCAN_API_KEY not set — skipping EVM chains")
 
     # Start Solana scanner
-    if SOLSCAN_API_KEY:
+    if HELIUS_API_KEY:
         t = threading.Thread(target=scan_solana, daemon=True)
         t.start()
         threads.append(t)
         log.info("Solana scanner thread started")
     else:
-        log.warning("SOLSCAN_API_KEY not set — skipping Solana")
+        log.warning("HELIUS_API_KEY not set — skipping Solana")
 
     if not threads:
-        log.error("No API keys configured. Set BASESCAN_API_KEY and/or SOLSCAN_API_KEY.")
+        log.error("No API keys configured. Set BASESCAN_API_KEY and/or HELIUS_API_KEY.")
         return
 
     try:
