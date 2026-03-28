@@ -1,6 +1,6 @@
 """
 PiggyBac — Multi-chain fresh-wallet + dormant-wallet buy detector.
-Monitors Base and Ethereum mainnet for coordinated buying by:
+Monitors Base, Ethereum mainnet, and Solana for coordinated buying by:
   - Fresh wallets: created/funded in the last 24h
   - Dormant wallets: last active 6+ months ago, now suddenly buying
 
@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 API_KEY = os.getenv("BASESCAN_API_KEY", "")  # works for both Etherscan + Basescan
+SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -45,6 +46,38 @@ MIN_BUY_VALUE_USD = 50                 # placeholder
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 )
+
+# ---------------------------------------------------------------------------
+# Solana config
+# ---------------------------------------------------------------------------
+
+SOLSCAN_BASE_URL = "https://pro-api.solscan.io/v2.0"
+SOLANA_POLL_INTERVAL_SECONDS = 30
+
+# Known Solana DEX program IDs
+SOLANA_DEX_PROGRAMS = {
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM",
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc":  "Orca Whirlpool",
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP": "Orca Token Swap",
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4":  "Jupiter v6",
+    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB":  "Jupiter v4",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":  "Pump.fun",
+}
+
+# Known Solana CEX/bridge addresses for funding source detection
+SOLANA_KNOWN_FUNDING_SOURCES = {
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM": "Binance",
+    "5tzFkiKscjHK98YYXtN2sVPBTZM7HNpVRbPVdBbRjQwR": "Binance",
+    "2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S": "Binance",
+    "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS": "Coinbase",
+    "GJRs4FwHtemZ5ZE9x3FNvJ8TMwitKTh21yxdRPqn7npE": "Coinbase",
+    "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5": "Kraken",
+    "CuieVDEDtLo7FypA9SbLM9SaXEi5Wfv7R8HH6kHMh64d": "OKX",
+    "A77HErqtfN1hLLpvZ9pBaGHR4PK4Ky1rkNy5P1o4gMd":  "Phantom Swap",
+}
+
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # ---------------------------------------------------------------------------
 # Chain definitions
@@ -100,22 +133,27 @@ CHAINS = {
 # Per-chain state
 # ---------------------------------------------------------------------------
 
+ALL_CHAIN_IDS = list(CHAINS.keys()) + ["solana"]
+
 # chain_id -> token_address -> list of buy dicts
 cluster_buys: dict[str, dict[str, list[dict]]] = {
-    chain: defaultdict(list) for chain in CHAINS
+    chain: defaultdict(list) for chain in ALL_CHAIN_IDS
 }
 
 # chain_id -> wallet_address -> {first_ts, last_ts}
-wallet_cache: dict[str, dict[str, dict]] = {chain: {} for chain in CHAINS}
+wallet_cache: dict[str, dict[str, dict]] = {chain: {} for chain in ALL_CHAIN_IDS}
 
 # chain_id -> token_address -> {name, symbol}
-token_info_cache: dict[str, dict[str, dict]] = {chain: {} for chain in CHAINS}
+token_info_cache: dict[str, dict[str, dict]] = {chain: {} for chain in ALL_CHAIN_IDS}
 
 # set of cluster keys already alerted
 alerted_clusters: set[str] = set()
 
-# chain_id -> last block processed
+# chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
+
+# Solana: last seen transaction signature to avoid re-processing
+solana_last_seen_sig: str = ""
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -468,7 +506,387 @@ def process_transfers(chain_id: str, transfers: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-chain scan loop
+# Solana — Solscan v2 API helpers
+# ---------------------------------------------------------------------------
+
+SOLSCAN_HEADERS = {}
+
+
+def _init_solscan_headers() -> None:
+    global SOLSCAN_HEADERS
+    SOLSCAN_HEADERS = {"token": SOLSCAN_API_KEY}
+
+
+def solscan_get(endpoint: str, params: dict | None = None) -> dict | None:
+    """GET request to Solscan Pro v2 API."""
+    if not SOLSCAN_HEADERS:
+        _init_solscan_headers()
+    url = f"{SOLSCAN_BASE_URL}{endpoint}"
+    try:
+        r = requests.get(url, params=params or {}, headers=SOLSCAN_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("success") is True or "data" in data:
+            return data
+        log.debug("[solana] Solscan non-success: %s", data)
+        return data  # return anyway, some endpoints don't have 'success'
+    except Exception as exc:
+        log.warning("[solana] Solscan request failed: %s %s", endpoint, exc)
+        return None
+
+
+def solscan_get_account_transfers(account: str, page: int = 1, page_size: int = 20) -> list[dict]:
+    """Get recent token transfers for a Solana account."""
+    data = solscan_get(
+        f"/account/transfer",
+        params={
+            "address": account,
+            "page": page,
+            "page_size": page_size,
+            "exclude_amount_zero": "true",
+        },
+    )
+    if data and "data" in data:
+        return data["data"] if isinstance(data["data"], list) else []
+    return []
+
+
+def solscan_get_defi_activities(page: int = 1, page_size: int = 40) -> list[dict]:
+    """
+    Get recent DeFi activities across Solana DEXes.
+    Uses the /defi/activities endpoint filtered to swap-type activities
+    on the programs we care about.
+    """
+    all_activities = []
+    for program_id in SOLANA_DEX_PROGRAMS:
+        data = solscan_get(
+            "/defi/activities",
+            params={
+                "platform": program_id,
+                "activity_type": "ACTIVITY_TOKEN_SWAP",
+                "page": page,
+                "page_size": page_size,
+                "sort_by": "block_time",
+                "sort_order": "desc",
+            },
+        )
+        if data and "data" in data:
+            activities = data["data"] if isinstance(data["data"], list) else []
+            all_activities.extend(activities)
+        time.sleep(0.25)  # respect rate limits
+    return all_activities
+
+
+def solscan_get_wallet_first_last_tx(address: str) -> dict | None:
+    """
+    Get first and last transaction timestamps for a Solana wallet.
+    Uses the /account/transactions endpoint. Cached.
+    """
+    cache = wallet_cache["solana"]
+    if address in cache:
+        return cache[address]
+
+    # Get earliest transaction
+    first_data = solscan_get(
+        "/account/transactions",
+        params={
+            "address": address,
+            "page": 1,
+            "page_size": 1,
+            "sort_by": "block_time",
+            "sort_order": "asc",
+        },
+    )
+    # Get latest transaction
+    last_data = solscan_get(
+        "/account/transactions",
+        params={
+            "address": address,
+            "page": 1,
+            "page_size": 1,
+            "sort_by": "block_time",
+            "sort_order": "desc",
+        },
+    )
+
+    first_ts = None
+    last_ts = None
+
+    if first_data and "data" in first_data:
+        items = first_data["data"] if isinstance(first_data["data"], list) else []
+        if items:
+            first_ts = items[0].get("block_time") or items[0].get("blockTime")
+    if last_data and "data" in last_data:
+        items = last_data["data"] if isinstance(last_data["data"], list) else []
+        if items:
+            last_ts = items[0].get("block_time") or items[0].get("blockTime")
+
+    if first_ts is None:
+        return None
+
+    result = {"first_ts": int(first_ts), "last_ts": int(last_ts or first_ts)}
+    cache[address] = result
+    return result
+
+
+def classify_solana_wallet(address: str) -> str | None:
+    """Classify a Solana wallet as fresh, dormant, or uninteresting."""
+    ts = solscan_get_wallet_first_last_tx(address)
+    if not ts:
+        return None
+
+    now = NOW_TS()
+    age_hours = (now - ts["first_ts"]) / 3600
+    inactive_days = (now - ts["last_ts"]) / 86400
+
+    if age_hours <= FRESH_WALLET_MAX_AGE_HOURS:
+        return "fresh"
+    if inactive_days >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
+        return "dormant"
+    return None
+
+
+def get_solana_funding_source(address: str) -> str | None:
+    """Check first few transfers to see if wallet was funded by a known CEX."""
+    transfers = solscan_get_account_transfers(address, page=1, page_size=5)
+    for tx in transfers:
+        sender = tx.get("from_address") or tx.get("src") or ""
+        for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
+            if sender == known_addr:
+                return label
+    return None
+
+
+def get_solana_token_info(token_mint: str) -> dict:
+    """Fetch token name/symbol from Solscan. Cached."""
+    cache = token_info_cache["solana"]
+    if token_mint in cache:
+        return cache[token_mint]
+
+    data = solscan_get(f"/token/meta", params={"address": token_mint})
+    if data and "data" in data:
+        meta = data["data"]
+        info = {
+            "name": meta.get("name") or "Unknown",
+            "symbol": meta.get("symbol") or "???",
+        }
+    else:
+        info = {"name": "Unknown", "symbol": "???"}
+
+    cache[token_mint] = info
+    return info
+
+
+def build_solana_alert(token_address: str, buys: list[dict]) -> str:
+    """Build a Telegram alert message for a Solana token cluster."""
+    info = get_solana_token_info(token_address)
+    token_name = info["name"]
+    token_symbol = info["symbol"]
+    short_addr = token_address[:6] + "..." + token_address[-4:]
+    explorer_url = f"https://solscan.io/token/{token_address}"
+    dexscreener_url = f"https://dexscreener.com/solana/{token_address}"
+
+    fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
+    dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
+
+    if buys:
+        earliest_ts = min(b["timestamp"] for b in buys)
+        speed_cutoff = earliest_ts + SPEED_WINDOW_MINUTES * 60
+        speed_count = sum(1 for b in buys if b["timestamp"] <= speed_cutoff)
+    else:
+        speed_count = 0
+
+    score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
+
+    wallet_lines = []
+    for b in fresh_buys:
+        short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
+        funding = b.get("funding_source") or "unknown"
+        tx_url = f"https://solscan.io/tx/{b['tx_hash']}"
+        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> (funded via {funding})")
+
+    for b in dormant_buys:
+        short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
+        tx_url = f"https://solscan.io/tx/{b['tx_hash']}"
+        inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
+        wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
+
+    wallets_str = "\n".join(wallet_lines)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    summary_parts = []
+    if fresh_buys:
+        summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
+    if dormant_buys:
+        summary_parts.append(f"{len(dormant_buys)} dormant 💤")
+    summary = " + ".join(summary_parts)
+
+    speed_str = f"{speed_count} wallets in first {SPEED_WINDOW_MINUTES}min" if speed_count > 1 else ""
+
+    return (
+        f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}\n\n"
+        f"<b>Token:</b> {token_name} ({token_symbol})\n"
+        f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
+        f"<b>Wallets:</b> {summary}\n"
+        + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
+        + f"\n{wallets_str}\n\n"
+        f"<a href='{dexscreener_url}'>DexScreener</a> | "
+        f"<a href='{explorer_url}'>Solscan</a>"
+    )
+
+
+def check_solana_clusters() -> None:
+    """Check Solana cluster_buys for alertable clusters."""
+    for token_address, buys in cluster_buys["solana"].items():
+        if len(buys) < CLUSTER_MIN_WALLETS:
+            continue
+        seen = {}
+        for b in buys:
+            seen[b["wallet"]] = b
+        unique_buys = list(seen.values())
+        if len(unique_buys) < CLUSTER_MIN_WALLETS:
+            continue
+
+        cluster_key = "solana" + token_address + str(
+            sorted(b["wallet"] for b in unique_buys)
+        )
+        if cluster_key in alerted_clusters:
+            continue
+        alerted_clusters.add(cluster_key)
+
+        fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
+        dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
+        log.info(
+            "[solana] CLUSTER: %d fresh + %d dormant wallets bought %s",
+            fresh_count, dormant_count, token_address,
+        )
+        message = build_solana_alert(token_address, unique_buys)
+        send_telegram(message)
+
+
+def process_solana_swaps(activities: list[dict]) -> None:
+    """Process Solana DEX swap activities, classify wallets, record buys."""
+    global solana_last_seen_sig
+    now = NOW_TS()
+    new_last_sig = solana_last_seen_sig
+    processed = 0
+
+    for act in activities:
+        tx_hash = act.get("trans_id") or act.get("tx_hash") or ""
+        if not tx_hash:
+            continue
+
+        # Skip if we've already seen this
+        if tx_hash == solana_last_seen_sig:
+            break
+
+        if processed == 0:
+            new_last_sig = tx_hash
+
+        block_time = act.get("block_time") or act.get("blockTime") or now
+
+        # Extract the signer/wallet
+        wallet = act.get("from_address") or act.get("signer") or ""
+        if not wallet:
+            continue
+
+        # Extract tokens involved — look for the token being bought (not SOL/WSOL)
+        # Activity format varies; handle token1/token2 or routed_token fields
+        token_bought = None
+
+        # Try structured token fields
+        token1 = act.get("token1") or ""
+        token2 = act.get("token2") or ""
+        # In a swap, one side is usually SOL/WSOL — the other is the token bought
+        if token1 and token1 != WSOL_MINT:
+            token_bought = token1
+        elif token2 and token2 != WSOL_MINT:
+            token_bought = token2
+
+        # Try routed format
+        if not token_bought:
+            routed = act.get("routed_token") or act.get("token_address") or ""
+            if routed and routed != WSOL_MINT:
+                token_bought = routed
+
+        if not token_bought:
+            continue
+
+        # Classify the wallet
+        wallet_type = classify_solana_wallet(wallet)
+        if wallet_type is None:
+            processed += 1
+            continue
+
+        funding_source = None
+        last_ts = now
+        ts_data = wallet_cache["solana"].get(wallet)
+        if ts_data:
+            last_ts = ts_data["last_ts"]
+
+        if wallet_type == "fresh":
+            funding_source = get_solana_funding_source(wallet)
+
+        dex_label = ""
+        platform = act.get("platform") or act.get("program_id") or ""
+        if platform in SOLANA_DEX_PROGRAMS:
+            dex_label = SOLANA_DEX_PROGRAMS[platform]
+
+        log.info(
+            "[solana] %s wallet buy: wallet=%s token=%s dex=%s",
+            wallet_type, wallet[:10], token_bought[:10], dex_label,
+        )
+
+        cluster_buys["solana"][token_bought].append(
+            {
+                "wallet": wallet,
+                "wallet_type": wallet_type,
+                "timestamp": int(block_time),
+                "last_ts": last_ts,
+                "tx_hash": tx_hash,
+                "funding_source": funding_source,
+                "dex": dex_label,
+            }
+        )
+        processed += 1
+
+    solana_last_seen_sig = new_last_sig
+    return processed
+
+
+def prune_solana_old_buys() -> None:
+    cutoff = NOW_TS() - CLUSTER_TIME_WINDOW_HOURS * 3600
+    buys = cluster_buys["solana"]
+    for token in list(buys.keys()):
+        buys[token] = [b for b in buys[token] if b["timestamp"] >= cutoff]
+        if not buys[token]:
+            del buys[token]
+
+
+def scan_solana() -> None:
+    """Main Solana scanner loop — polls Solscan for DEX swap activity."""
+    log.info("[Solana] Starting up...")
+    _init_solscan_headers()
+
+    while True:
+        try:
+            activities = solscan_get_defi_activities(page=1, page_size=40)
+            log.info("[Solana] Got %d swap activities across DEXes", len(activities))
+
+            count = process_solana_swaps(activities)
+            log.info("[Solana] Processed %d new swaps", count or 0)
+
+            prune_solana_old_buys()
+            check_solana_clusters()
+
+        except Exception as exc:
+            log.error("[solana] Error: %s", exc, exc_info=True)
+
+        time.sleep(SOLANA_POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Per-chain scan loop (EVM)
 # ---------------------------------------------------------------------------
 
 
@@ -514,16 +932,30 @@ def scan_chain(chain_id: str) -> None:
 
 
 def main() -> None:
-    if not API_KEY:
-        log.error("BASESCAN_API_KEY not set. Exiting.")
-        return
-
     threads = []
-    for chain_id in CHAINS:
-        t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
+
+    # Start EVM chain scanners (Base + Ethereum)
+    if API_KEY:
+        for chain_id in CHAINS:
+            t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
+            t.start()
+            threads.append(t)
+            time.sleep(2)  # stagger startup to avoid API rate limit spike
+    else:
+        log.warning("BASESCAN_API_KEY not set — skipping EVM chains")
+
+    # Start Solana scanner
+    if SOLSCAN_API_KEY:
+        t = threading.Thread(target=scan_solana, daemon=True)
         t.start()
         threads.append(t)
-        time.sleep(2)  # stagger startup to avoid API rate limit spike
+        log.info("Solana scanner thread started")
+    else:
+        log.warning("SOLSCAN_API_KEY not set — skipping Solana")
+
+    if not threads:
+        log.error("No API keys configured. Set BASESCAN_API_KEY and/or SOLSCAN_API_KEY.")
+        return
 
     try:
         while True:
