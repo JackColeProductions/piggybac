@@ -879,11 +879,46 @@ def prune_solana_old_buys() -> None:
             del buys[token]
 
 
+def _solscan_auth_probe() -> str:
+    """
+    Test auth against the cheapest Solscan endpoint (/account/transactions
+    for a known public address). Returns 'ok', 'auth_fail', or 'error'.
+    """
+    # Raydium AMM program — public, high activity, good test subject
+    test_addr = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+    try:
+        r = requests.get(
+            f"{SOLSCAN_BASE_URL}/account/transactions",
+            params={"address": test_addr, "page": 1, "page_size": 1},
+            headers=SOLSCAN_HEADERS,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return "ok"
+        if r.status_code == 401:
+            return "auth_fail"
+        return f"http_{r.status_code}"
+    except Exception as exc:
+        return f"error:{exc}"
+
+
 def scan_solana() -> None:
     """Main Solana scanner loop — polls Solscan /token/defi/activities for WSOL swaps."""
     key_preview = (SOLSCAN_API_KEY[:8] + "..." + SOLSCAN_API_KEY[-4:]) if len(SOLSCAN_API_KEY) > 12 else f"(len={len(SOLSCAN_API_KEY)})"
     log.info("[Solana] Starting up... API key preview: %s", key_preview)
     _init_solscan_headers()
+
+    probe = _solscan_auth_probe()
+    if probe == "ok":
+        log.info("[Solana] Auth probe OK — API key is valid")
+    elif probe == "auth_fail":
+        log.error(
+            "[Solana] Auth probe FAILED (401) — API key is invalid or expired. "
+            "Check your Solscan Pro account at https://pro-api.solscan.io"
+        )
+        return
+    else:
+        log.warning("[Solana] Auth probe result: %s — proceeding anyway", probe)
 
     while True:
         try:
