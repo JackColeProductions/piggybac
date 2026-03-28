@@ -181,8 +181,16 @@ token_info_cache: dict[str, dict[str, dict]] = {chain: {} for chain in ALL_CHAIN
 # set of cluster keys already alerted
 alerted_clusters: set[str] = set()
 
+# chain_id -> token_address -> last alert timestamp (Unix)
+# Prevents re-alerting the same token within ALERT_COOLDOWN_SECONDS
+token_last_alerted: dict[str, dict[str, int]] = {chain: {} for chain in ALL_CHAIN_IDS}
+ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 minutes between alerts for same token
+
 # token_address -> age_hours (None = lookup failed / treat as unknown)
 token_age_cache: dict[str, float | None] = {}
+
+# token_address -> {name, symbol} cached from DexScreener (populated alongside age lookup)
+dexscreener_name_cache: dict[str, dict] = {}
 
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
@@ -504,7 +512,7 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
     Return how many hours old a token is by querying DexScreener for its
     earliest pair creation time. Returns None if lookup fails (caller
     should treat as unknown / allow through).
-    Cached in token_age_cache to avoid re-querying.
+    Also caches token name/symbol into dexscreener_name_cache as a side effect.
     """
     if token_address in token_age_cache:
         return token_age_cache[token_address]
@@ -520,6 +528,18 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
         if not pairs:
             token_age_cache[token_address] = None
             return None
+
+        # Cache name/symbol from first pair while we're here
+        if token_address not in dexscreener_name_cache:
+            base = pairs[0].get("baseToken") or {}
+            name = base.get("name") or ""
+            symbol = base.get("symbol") or ""
+            if name or symbol:
+                dexscreener_name_cache[token_address] = {
+                    "name": name or "Unknown",
+                    "symbol": symbol or "???",
+                }
+
         # Find the earliest pair creation timestamp (ms → s)
         earliest_ms = min(
             p["pairCreatedAt"] for p in pairs if p.get("pairCreatedAt")
@@ -667,12 +687,11 @@ def check_for_clusters(chain_id: str) -> None:
             log.debug("[%s] Skipping old token %s", chain_id, token_address[:10])
             continue
 
-        cluster_key = chain_id + token_address + str(
-            sorted(b["wallet"] for b in unique_buys)
-        )
-        if cluster_key in alerted_clusters:
+        # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
+        last_alert_ts = token_last_alerted[chain_id].get(token_address, 0)
+        if NOW_TS() - last_alert_ts < ALERT_COOLDOWN_SECONDS:
             continue
-        alerted_clusters.add(cluster_key)
+        token_last_alerted[chain_id][token_address] = NOW_TS()
 
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
         dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
@@ -920,6 +939,12 @@ def get_solana_token_info(token_mint: str) -> dict:
     if token_mint in cache:
         return cache[token_mint]
 
+    # Try DexScreener cache first (populated for free during age lookup)
+    if token_mint in dexscreener_name_cache:
+        info = dexscreener_name_cache[token_mint]
+        cache[token_mint] = info
+        return info
+
     try:
         r = requests.post(
             f"{HELIUS_API_URL}/token-metadata",
@@ -931,17 +956,49 @@ def get_solana_token_info(token_mint: str) -> dict:
         results = r.json()
         if results and isinstance(results, list):
             meta = results[0]
-            # Try on-chain metadata first, fall back to legacy
-            on_chain = (meta.get("onChainMetadata") or {}).get("metadata", {}).get("data", {})
+            on_chain_meta = (meta.get("onChainMetadata") or {}).get("metadata") or {}
             legacy = meta.get("legacyMetadata") or {}
-            name = on_chain.get("name") or legacy.get("name") or "Unknown"
-            symbol = on_chain.get("symbol") or legacy.get("symbol") or "???"
-            info = {"name": name.strip("\x00"), "symbol": symbol.strip("\x00")}
+            # Try multiple paths: metadata.name, metadata.data.name, legacyMetadata.name
+            name = (
+                on_chain_meta.get("name")
+                or (on_chain_meta.get("data") or {}).get("name")
+                or legacy.get("name")
+                or ""
+            )
+            symbol = (
+                on_chain_meta.get("symbol")
+                or (on_chain_meta.get("data") or {}).get("symbol")
+                or legacy.get("symbol")
+                or ""
+            )
+            if name or symbol:
+                info = {"name": name.strip("\x00") or "Unknown", "symbol": symbol.strip("\x00") or "???"}
+            else:
+                info = {"name": "Unknown", "symbol": "???"}
         else:
             info = {"name": "Unknown", "symbol": "???"}
     except Exception as exc:
         log.debug("[solana] Token metadata fetch failed for %s: %s", token_mint[:10], exc)
         info = {"name": "Unknown", "symbol": "???"}
+
+    # If Helius still returned Unknown, try DexScreener directly
+    if info["name"] == "Unknown":
+        try:
+            r2 = requests.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}",
+                timeout=8,
+            )
+            r2.raise_for_status()
+            pairs = r2.json().get("pairs") or []
+            if pairs:
+                base = pairs[0].get("baseToken") or {}
+                ds_name = base.get("name") or ""
+                ds_symbol = base.get("symbol") or ""
+                if ds_name:
+                    info = {"name": ds_name, "symbol": ds_symbol or "???"}
+                    dexscreener_name_cache[token_mint] = info
+        except Exception:
+            pass
 
     cache[token_mint] = info
     return info
@@ -1034,12 +1091,11 @@ def check_solana_clusters() -> None:
             log.debug("[solana] Skipping old token %s", token_address[:10])
             continue
 
-        cluster_key = "solana" + token_address + str(
-            sorted(b["wallet"] for b in unique_buys)
-        )
-        if cluster_key in alerted_clusters:
+        # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
+        last_alert_ts = token_last_alerted["solana"].get(token_address, 0)
+        if NOW_TS() - last_alert_ts < ALERT_COOLDOWN_SECONDS:
             continue
-        alerted_clusters.add(cluster_key)
+        token_last_alerted["solana"][token_address] = NOW_TS()
 
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
         dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
