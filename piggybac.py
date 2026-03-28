@@ -902,7 +902,9 @@ def get_solana_funding_source(address: str) -> str | None:
             continue
         meta = result.get("meta") or {}
         for instruction in (result.get("transaction", {}).get("message", {}).get("instructions") or []):
-            parsed = instruction.get("parsed") or {}
+            parsed = instruction.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
             info = parsed.get("info") or {}
             sender = info.get("source") or info.get("authority") or ""
             for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
