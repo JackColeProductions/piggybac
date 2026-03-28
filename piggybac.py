@@ -510,19 +510,28 @@ def process_transfers(chain_id: str, transfers: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def helius_get(endpoint: str, params: dict | None = None) -> list | dict | None:
-    """GET request to Helius Enhanced Transactions API."""
+def helius_get(endpoint: str, params: dict | None = None, _retries: int = 3) -> list | dict | None:
+    """GET request to Helius Enhanced Transactions API with 429 backoff."""
     url = f"{HELIUS_API_URL}{endpoint}"
     p = {"api-key": HELIUS_API_KEY}
     if params:
         p.update(params)
-    try:
-        r = requests.get(url, params=p, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as exc:
-        log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
-        return None
+    for attempt in range(_retries):
+        try:
+            r = requests.get(url, params=p, timeout=15)
+            if r.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                log.debug("[solana] Helius 429 on %s — backing off %ds", endpoint, wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            if attempt < _retries - 1:
+                time.sleep(1)
+            else:
+                log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
+    return None
 
 
 def helius_rpc(method: str, params: list) -> object:
@@ -609,22 +618,28 @@ def classify_solana_wallet(address: str) -> str | None:
 
 
 def get_solana_funding_source(address: str) -> str | None:
-    """Check earliest transactions to see if wallet was funded by a known CEX."""
-    # Get the oldest transactions (reverse the newest-first list)
+    """
+    Check earliest transactions to see if wallet was funded by a known CEX.
+    Uses RPC getTransaction (cheaper than Enhanced API) on the 2 oldest sigs.
+    """
     sigs = helius_rpc("getSignaturesForAddress", [address, {"limit": 10}])
     if not sigs:
         return None
-    # Fetch enhanced tx details for the earliest signatures
-    oldest_sigs = [s["signature"] for s in reversed(sigs)][:5]
+    # Check only the 2 oldest signatures (reversed list = oldest last)
+    oldest_sigs = [s["signature"] for s in reversed(sigs)][:2]
     for sig in oldest_sigs:
-        data = helius_get(f"/transactions", params={"transactions": sig})
-        txs = data if isinstance(data, list) else []
-        for tx in txs:
-            for transfer in tx.get("nativeTransfers", []):
-                sender = transfer.get("fromUserAccount", "")
-                for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
-                    if sender == known_addr:
-                        return label
+        result = helius_rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+        if not result:
+            continue
+        meta = result.get("meta") or {}
+        for instruction in (result.get("transaction", {}).get("message", {}).get("instructions") or []):
+            parsed = instruction.get("parsed") or {}
+            info = parsed.get("info") or {}
+            sender = info.get("source") or info.get("authority") or ""
+            for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
+                if sender == known_addr:
+                    return label
+        time.sleep(0.1)
     return None
 
 
@@ -790,6 +805,7 @@ def process_helius_swaps(txs: list[dict], program_id: str) -> int:
             continue
 
         wallet_type = classify_solana_wallet(wallet)
+        time.sleep(0.15)  # gentle rate limit between RPC wallet lookups
         if wallet_type is None:
             processed += 1
             continue
