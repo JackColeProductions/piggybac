@@ -219,10 +219,12 @@ def alchemy_rpc(chain_id: str, method: str, params: list) -> object:
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=10,
         )
-        r.raise_for_status()
+        if not r.ok:
+            log.warning("[%s] Alchemy RPC %s HTTP %d: %s", chain_id, method, r.status_code, r.text[:300])
+            return None
         data = r.json()
         if "error" in data:
-            log.debug("[%s] Alchemy RPC error: %s", chain_id, data["error"])
+            log.warning("[%s] Alchemy RPC %s error: %s", chain_id, method, data["error"])
             return None
         return data.get("result")
     except Exception as exc:
@@ -244,14 +246,27 @@ def get_latest_block(chain_id: str) -> int:
     return int(result, 16) if result else 0
 
 
+MAX_BLOCKS_PER_SCAN = 5  # keeps eth_getLogs result set small on high-throughput chains like Base
+
+
 def get_erc20_transfers(chain_id: str, from_block: int, to_block: int) -> list[dict]:
-    """Fetch ERC-20 Transfer logs for a block range via Alchemy eth_getLogs."""
-    result = alchemy_rpc(chain_id, "eth_getLogs", [{
-        "fromBlock": hex(from_block),
-        "toBlock": hex(to_block),
-        "topics": [ERC20_TRANSFER_TOPIC],
-    }])
-    return result if isinstance(result, list) else []
+    """
+    Fetch ERC-20 Transfer logs for a block range via Alchemy eth_getLogs.
+    Chunked to MAX_BLOCKS_PER_SCAN to stay within Alchemy result limits.
+    """
+    all_results = []
+    chunk_start = from_block
+    while chunk_start <= to_block:
+        chunk_end = min(chunk_start + MAX_BLOCKS_PER_SCAN - 1, to_block)
+        result = alchemy_rpc(chain_id, "eth_getLogs", [{
+            "fromBlock": hex(chunk_start),
+            "toBlock": hex(chunk_end),
+            "topics": [ERC20_TRANSFER_TOPIC],
+        }])
+        if isinstance(result, list):
+            all_results.extend(result)
+        chunk_start = chunk_end + 1
+    return all_results
 
 
 def _alchemy_asset_transfers(chain_id: str, direction: str, address: str, order: str = "asc") -> list[dict]:
