@@ -553,32 +553,44 @@ def solscan_get_account_transfers(account: str, page: int = 1, page_size: int = 
 
 def solscan_get_defi_activities(page: int = 1, page_size: int = 100) -> list[dict]:
     """
-    Get recent Solana DEX swap activities and filter to known DEX programs.
-    Single API call — platform filter not supported by the endpoint, so we
-    fetch all swap activities and filter locally by known program IDs.
+    Get recent Solana DEX swap activities by querying /token/defi/activities for WSOL.
+    Nearly every Solana token swap involves WSOL on one side, so this acts as
+    a broad feed of all DEX swap activity. We pass platform[] to filter to our
+    known DEX programs (Raydium, Orca, Jupiter, Pump.fun).
+
+    The (non-existent) global /defi/activities endpoint has been replaced with
+    /token/defi/activities?address=WSOL, which is the correct v2 approach.
     """
-    data = solscan_get(
-        "/defi/activities",
-        params={
-            "activity_type[]": "ACTIVITY_TOKEN_SWAP",
-            "page": page,
-            "page_size": page_size,
-            "sort_by": "block_time",
-            "sort_order": "desc",
-        },
-    )
-    if not data or "data" not in data:
-        return []
-    activities = data["data"] if isinstance(data["data"], list) else []
-    # Filter to only swaps that went through our known DEX programs
-    known = set(SOLANA_DEX_PROGRAMS.keys())
-    filtered = [
-        a for a in activities
-        if (a.get("platform") or a.get("program_id") or a.get("source") or "") in known
+    # Build platform[] params as a list of (key, value) tuples so requests
+    # sends multiple values for the same key name.
+    params = [
+        ("address", WSOL_MINT),
+        ("activity_type[]", "ACTIVITY_TOKEN_SWAP"),
+        ("activity_type[]", "ACTIVITY_AGG_TOKEN_SWAP"),
+        ("page", page),
+        ("page_size", page_size),
+        ("sort_by", "block_time"),
+        ("sort_order", "desc"),
     ]
-    log.debug("[solana] Raw activities: %d, after DEX filter: %d", len(activities), len(filtered))
-    # If no platform field present, return all (let process_solana_swaps handle it)
-    return filtered if filtered else activities
+    for program_id in SOLANA_DEX_PROGRAMS:
+        params.append(("platform[]", program_id))
+
+    url = f"{SOLSCAN_BASE_URL}/token/defi/activities"
+    try:
+        r = requests.get(url, params=params, headers=SOLSCAN_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("[solana] Solscan /token/defi/activities failed: %s", exc)
+        return []
+
+    if not data or "data" not in data:
+        log.debug("[solana] No data in response: %s", data)
+        return []
+
+    activities = data["data"] if isinstance(data["data"], list) else []
+    log.debug("[solana] Got %d swap activities from /token/defi/activities", len(activities))
+    return activities
 
 
 def solscan_get_wallet_first_last_tx(address: str) -> dict | None:
@@ -868,14 +880,14 @@ def prune_solana_old_buys() -> None:
 
 
 def scan_solana() -> None:
-    """Main Solana scanner loop — polls Solscan for DEX swap activity."""
-    log.info("[Solana] Starting up...")
+    """Main Solana scanner loop — polls Solscan /token/defi/activities for WSOL swaps."""
+    log.info("[Solana] Starting up... monitoring WSOL swaps on Raydium/Orca/Jupiter/Pump.fun")
     _init_solscan_headers()
 
     while True:
         try:
-            activities = solscan_get_defi_activities(page=1, page_size=40)
-            log.info("[Solana] Got %d swap activities across DEXes", len(activities))
+            activities = solscan_get_defi_activities(page=1, page_size=100)
+            log.info("[Solana] Got %d swap activities from DEXes", len(activities))
 
             count = process_solana_swaps(activities)
             log.info("[Solana] Processed %d new swaps", count or 0)
