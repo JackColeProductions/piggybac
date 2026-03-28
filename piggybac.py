@@ -551,30 +551,34 @@ def solscan_get_account_transfers(account: str, page: int = 1, page_size: int = 
     return []
 
 
-def solscan_get_defi_activities(page: int = 1, page_size: int = 40) -> list[dict]:
+def solscan_get_defi_activities(page: int = 1, page_size: int = 100) -> list[dict]:
     """
-    Get recent DeFi activities across Solana DEXes.
-    Uses the /defi/activities endpoint filtered to swap-type activities
-    on the programs we care about.
+    Get recent Solana DEX swap activities and filter to known DEX programs.
+    Single API call — platform filter not supported by the endpoint, so we
+    fetch all swap activities and filter locally by known program IDs.
     """
-    all_activities = []
-    for program_id in SOLANA_DEX_PROGRAMS:
-        data = solscan_get(
-            "/defi/activities",
-            params={
-                "platform": program_id,
-                "activity_type": "ACTIVITY_TOKEN_SWAP",
-                "page": page,
-                "page_size": page_size,
-                "sort_by": "block_time",
-                "sort_order": "desc",
-            },
-        )
-        if data and "data" in data:
-            activities = data["data"] if isinstance(data["data"], list) else []
-            all_activities.extend(activities)
-        time.sleep(0.25)  # respect rate limits
-    return all_activities
+    data = solscan_get(
+        "/defi/activities",
+        params={
+            "activity_type[]": "ACTIVITY_TOKEN_SWAP",
+            "page": page,
+            "page_size": page_size,
+            "sort_by": "block_time",
+            "sort_order": "desc",
+        },
+    )
+    if not data or "data" not in data:
+        return []
+    activities = data["data"] if isinstance(data["data"], list) else []
+    # Filter to only swaps that went through our known DEX programs
+    known = set(SOLANA_DEX_PROGRAMS.keys())
+    filtered = [
+        a for a in activities
+        if (a.get("platform") or a.get("program_id") or a.get("source") or "") in known
+    ]
+    log.debug("[solana] Raw activities: %d, after DEX filter: %d", len(activities), len(filtered))
+    # If no platform field present, return all (let process_solana_swaps handle it)
+    return filtered if filtered else activities
 
 
 def solscan_get_wallet_first_last_tx(address: str) -> dict | None:
