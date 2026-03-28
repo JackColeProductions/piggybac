@@ -42,6 +42,7 @@ CLUSTER_TIME_WINDOW_HOURS = 2          # rolling window for clustering
 SPEED_WINDOW_MINUTES = 4               # window for speed bonus scoring
 POLL_INTERVAL_SECONDS = 30
 MIN_BUY_VALUE_USD = 50                 # placeholder
+TOKEN_MAX_AGE_DAYS = 3                 # ignore tokens launched more than this many days ago
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -148,6 +149,9 @@ token_info_cache: dict[str, dict[str, dict]] = {chain: {} for chain in ALL_CHAIN
 
 # set of cluster keys already alerted
 alerted_clusters: set[str] = set()
+
+# token_address -> age_hours (None = lookup failed / treat as unknown)
+token_age_cache: dict[str, float | None] = {}
 
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
@@ -323,6 +327,53 @@ def get_token_info(chain_id: str, token_address: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Token age check (DexScreener — free, no auth)
+# ---------------------------------------------------------------------------
+
+
+def get_token_age_hours(token_address: str, dexscreener_network: str = "solana") -> float | None:
+    """
+    Return how many hours old a token is by querying DexScreener for its
+    earliest pair creation time. Returns None if lookup fails (caller
+    should treat as unknown / allow through).
+    Cached in token_age_cache to avoid re-querying.
+    """
+    if token_address in token_age_cache:
+        return token_age_cache[token_address]
+
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            token_age_cache[token_address] = None
+            return None
+        # Find the earliest pair creation timestamp (ms → s)
+        earliest_ms = min(
+            p["pairCreatedAt"] for p in pairs if p.get("pairCreatedAt")
+        )
+        age_hours = (NOW_TS() - earliest_ms / 1000) / 3600
+        token_age_cache[token_address] = age_hours
+        return age_hours
+    except Exception as exc:
+        log.debug("DexScreener age lookup failed for %s: %s", token_address[:10], exc)
+        token_age_cache[token_address] = None
+        return None
+
+
+def is_token_too_old(token_address: str, network: str = "solana") -> bool:
+    """Returns True if the token launched more than TOKEN_MAX_AGE_DAYS ago."""
+    age = get_token_age_hours(token_address, network)
+    if age is None:
+        return False  # unknown age → allow through rather than silently drop
+    return age > TOKEN_MAX_AGE_DAYS * 24
+
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
@@ -428,6 +479,7 @@ def prune_old_buys(chain_id: str) -> None:
 
 
 def check_for_clusters(chain_id: str) -> None:
+    network = CHAINS[chain_id]["dexscreener_network"]
     for token_address, buys in cluster_buys[chain_id].items():
         if len(buys) < CLUSTER_MIN_WALLETS:
             continue
@@ -437,6 +489,10 @@ def check_for_clusters(chain_id: str) -> None:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
         if len(unique_buys) < CLUSTER_MIN_WALLETS:
+            continue
+
+        if is_token_too_old(token_address, network):
+            log.debug("[%s] Skipping old token %s", chain_id, token_address[:10])
             continue
 
         cluster_key = chain_id + token_address + str(
@@ -744,6 +800,10 @@ def check_solana_clusters() -> None:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
         if len(unique_buys) < CLUSTER_MIN_WALLETS:
+            continue
+
+        if is_token_too_old(token_address, "solana"):
+            log.debug("[solana] Skipping old token %s", token_address[:10])
             continue
 
         cluster_key = "solana" + token_address + str(
