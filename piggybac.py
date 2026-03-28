@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()
+API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()  # kept for fallback, unused if Alchemy set
+ALCHEMY_ETH_KEY = os.getenv("ALCHEMY_ETH_API_KEY", "").strip()
+ALCHEMY_BASE_KEY = os.getenv("ALCHEMY_BASE_API_KEY", "").strip()
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip().strip('"\'')
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -82,10 +84,24 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 # Chain definitions
 # ---------------------------------------------------------------------------
 
+ALCHEMY_URLS = {
+    "ethereum": "https://eth-mainnet.g.alchemy.com/v2/",
+    "base":     "https://base-mainnet.g.alchemy.com/v2/",
+}
+
+ALCHEMY_KEYS = {
+    "ethereum": ALCHEMY_ETH_KEY,
+    "base":     ALCHEMY_BASE_KEY,
+}
+
+
+def alchemy_url(chain_id: str) -> str:
+    return ALCHEMY_URLS[chain_id] + ALCHEMY_KEYS[chain_id]
+
+
 CHAINS = {
     "base": {
         "name": "Base",
-        "api_url": "https://api.basescan.org/api",
         "explorer_url": "https://basescan.org",
         "dexscreener_network": "base",
         "dex_routers": {
@@ -105,7 +121,6 @@ CHAINS = {
     },
     "ethereum": {
         "name": "Ethereum",
-        "api_url": "https://api.etherscan.io/api",
         "explorer_url": "https://etherscan.io",
         "dexscreener_network": "ethereum",
         "dex_routers": {
@@ -196,72 +211,100 @@ def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count:
 NOW_TS = lambda: int(time.time())
 
 
-def chain_get(chain_id: str, params: dict) -> dict | None:
-    chain = CHAINS[chain_id]
-    params["apikey"] = API_KEY
+def alchemy_rpc(chain_id: str, method: str, params: list) -> object:
+    """JSON-RPC call to Alchemy."""
     try:
-        r = requests.get(chain["api_url"], params=params, timeout=10)
+        r = requests.post(
+            alchemy_url(chain_id),
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=10,
+        )
         r.raise_for_status()
         data = r.json()
-        if data.get("status") == "1" or data.get("message") == "OK":
-            return data
-        log.debug("[%s] API non-1 status: %s", chain_id, data.get("message"))
-        return None
+        if "error" in data:
+            log.debug("[%s] Alchemy RPC error: %s", chain_id, data["error"])
+            return None
+        return data.get("result")
     except Exception as exc:
-        log.warning("[%s] API request failed: %s", chain_id, exc)
+        log.warning("[%s] Alchemy RPC %s failed: %s", chain_id, method, exc)
         return None
+
+
+def _parse_alchemy_ts(iso_str: str) -> int:
+    """Parse Alchemy blockTimestamp ISO string to Unix int."""
+    # format: "2024-01-01T00:00:00.000Z"
+    try:
+        return int(datetime.strptime(iso_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return 0
 
 
 def get_latest_block(chain_id: str) -> int:
-    data = chain_get(chain_id, {"module": "proxy", "action": "eth_blockNumber"})
-    if data:
-        return int(data["result"], 16)
-    return 0
+    result = alchemy_rpc(chain_id, "eth_blockNumber", [])
+    return int(result, 16) if result else 0
 
 
 def get_erc20_transfers(chain_id: str, from_block: int, to_block: int) -> list[dict]:
-    data = chain_get(
-        chain_id,
-        {
-            "module": "logs",
-            "action": "getLogs",
-            "fromBlock": from_block,
-            "toBlock": to_block,
-            "topic0": ERC20_TRANSFER_TOPIC,
-            "page": 1,
-            "offset": 1000,
-        },
-    )
-    return data.get("result", []) if data else []
+    """Fetch ERC-20 Transfer logs for a block range via Alchemy eth_getLogs."""
+    result = alchemy_rpc(chain_id, "eth_getLogs", [{
+        "fromBlock": hex(from_block),
+        "toBlock": hex(to_block),
+        "topics": [ERC20_TRANSFER_TOPIC],
+    }])
+    return result if isinstance(result, list) else []
+
+
+def _alchemy_asset_transfers(chain_id: str, direction: str, address: str, order: str = "asc") -> list[dict]:
+    """Helper: get 1 asset transfer in `direction` (fromAddress/toAddress) order."""
+    result = alchemy_rpc(chain_id, "alchemy_getAssetTransfers", [{
+        direction: address,
+        "fromBlock": "0x0",
+        "toBlock": "latest",
+        "category": ["external", "erc20"],
+        "withMetadata": True,
+        "maxCount": "0x5",
+        "order": order,
+    }])
+    if result and "transfers" in result:
+        return result["transfers"]
+    return []
 
 
 def get_wallet_timestamps(chain_id: str, address: str) -> dict | None:
     """
-    Returns {first_ts, last_ts} for a wallet. Cached.
-    Makes two API calls (first tx asc, last tx desc).
+    Returns {first_ts, last_ts} for a wallet via Alchemy. Cached.
+    Uses alchemy_getAssetTransfers to find first and last activity.
     """
     cache = wallet_cache[chain_id]
     if address in cache:
         return cache[address]
 
-    base_params = {
-        "module": "account",
-        "action": "txlist",
-        "address": address,
-        "startblock": 0,
-        "endblock": 99999999,
-        "page": 1,
-        "offset": 1,
-    }
+    # First activity: earliest incoming ETH (wallet creation/funding)
+    first_in = _alchemy_asset_transfers(chain_id, "toAddress", address, "asc")
+    # Also check first outgoing (in case wallet sent before received)
+    first_out = _alchemy_asset_transfers(chain_id, "fromAddress", address, "asc")
 
-    first_data = chain_get(chain_id, {**base_params, "sort": "asc"})
-    last_data = chain_get(chain_id, {**base_params, "sort": "desc"})
+    candidates_first = []
+    for t in first_in + first_out:
+        ts_str = (t.get("metadata") or {}).get("blockTimestamp", "")
+        if ts_str:
+            candidates_first.append(_parse_alchemy_ts(ts_str))
 
-    if not first_data or not first_data.get("result"):
+    if not candidates_first:
         return None
 
-    first_ts = int(first_data["result"][0]["timeStamp"])
-    last_ts = int(last_data["result"][0]["timeStamp"]) if last_data and last_data.get("result") else first_ts
+    first_ts = min(candidates_first)
+
+    # Last activity: most recent outgoing transfer
+    last_out = _alchemy_asset_transfers(chain_id, "fromAddress", address, "desc")
+    last_in  = _alchemy_asset_transfers(chain_id, "toAddress", address, "desc")
+    candidates_last = []
+    for t in last_out + last_in:
+        ts_str = (t.get("metadata") or {}).get("blockTimestamp", "")
+        if ts_str:
+            candidates_last.append(_parse_alchemy_ts(ts_str))
+
+    last_ts = max(candidates_last) if candidates_last else first_ts
 
     result = {"first_ts": first_ts, "last_ts": last_ts}
     cache[address] = result
@@ -290,24 +333,17 @@ def classify_wallet(chain_id: str, address: str) -> str | None:
 
 
 def get_wallet_funding_source(chain_id: str, address: str) -> str | None:
-    data = chain_get(
-        chain_id,
-        {
-            "module": "account",
-            "action": "txlist",
-            "address": address,
-            "startblock": 0,
-            "endblock": 99999999,
-            "page": 1,
-            "offset": 5,
-            "sort": "asc",
-        },
-    )
-    if not data or not data.get("result"):
+    """
+    Look at the earliest incoming transfers to `address` and check if any
+    came from a known CEX/bridge (funding source detection).
+    Uses Alchemy alchemy_getAssetTransfers with order=asc to get earliest transfers.
+    """
+    transfers = _alchemy_asset_transfers(chain_id, "toAddress", address, "asc")
+    if not transfers:
         return None
     funding_sources = CHAINS[chain_id]["known_funding_sources"]
-    for tx in data["result"]:
-        sender = tx.get("from", "").lower()
+    for t in transfers:
+        sender = (t.get("from") or "").lower()
         for known_addr, label in funding_sources.items():
             if sender == known_addr.lower():
                 return label
@@ -315,11 +351,19 @@ def get_wallet_funding_source(chain_id: str, address: str) -> str | None:
 
 
 def get_token_info(chain_id: str, token_address: str) -> dict:
+    """Fetch ERC-20 token name/symbol via Alchemy alchemy_getTokenMetadata. Cached."""
     cache = token_info_cache[chain_id]
     if token_address in cache:
         return cache[token_address]
-    # P0: replace with real token lookup
-    info = {"name": "Unknown", "symbol": "???"}
+
+    result = alchemy_rpc(chain_id, "alchemy_getTokenMetadata", [token_address])
+    if result:
+        name = result.get("name") or "Unknown"
+        symbol = result.get("symbol") or "???"
+        info = {"name": name, "symbol": symbol}
+    else:
+        info = {"name": "Unknown", "symbol": "???"}
+
     cache[token_address] = info
     return info
 
@@ -1066,15 +1110,19 @@ def scan_chain(chain_id: str) -> None:
 def main() -> None:
     threads = []
 
-    # Start EVM chain scanners (Base + Ethereum)
-    if API_KEY:
-        for chain_id in CHAINS:
-            t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
-            t.start()
-            threads.append(t)
-            time.sleep(2)  # stagger startup to avoid API rate limit spike
-    else:
-        log.warning("BASESCAN_API_KEY not set — skipping EVM chains")
+    # Start EVM chain scanners (Base + Ethereum) — one thread per chain if key is set
+    evm_started = 0
+    for chain_id in CHAINS:
+        if not ALCHEMY_KEYS[chain_id]:
+            log.warning("[%s] ALCHEMY key not set — skipping", CHAINS[chain_id]["name"])
+            continue
+        t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
+        t.start()
+        threads.append(t)
+        evm_started += 1
+        time.sleep(2)  # stagger startup to avoid API rate limit spike
+    if not evm_started:
+        log.warning("No Alchemy EVM keys set — skipping EVM chains (set ALCHEMY_ETH_API_KEY / ALCHEMY_BASE_API_KEY)")
 
     # Start Solana scanner
     if HELIUS_API_KEY:
@@ -1086,7 +1134,7 @@ def main() -> None:
         log.warning("HELIUS_API_KEY not set — skipping Solana")
 
     if not threads:
-        log.error("No API keys configured. Set BASESCAN_API_KEY and/or HELIUS_API_KEY.")
+        log.error("No API keys configured. Set ALCHEMY_ETH_API_KEY / ALCHEMY_BASE_API_KEY and/or HELIUS_API_KEY.")
         return
 
     try:
