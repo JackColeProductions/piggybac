@@ -37,12 +37,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
-CLUSTER_MIN_WALLETS = 5                # min wallets (fresh+dormant) to alert
+CLUSTER_MIN_WALLETS = 5                # default min wallets (overridden by token age)
 CLUSTER_TIME_WINDOW_HOURS = 2          # rolling window for clustering
 SPEED_WINDOW_MINUTES = 4               # window for speed bonus scoring
 POLL_INTERVAL_SECONDS = 30
 MIN_BUY_VALUE_USD = 50                 # placeholder
-TOKEN_MAX_AGE_DAYS = 3                 # ignore tokens launched more than this many days ago
+TOKEN_MAX_AGE_DAYS = 1                 # ignore tokens launched more than this many days ago
+
+# Dynamic alert thresholds — lower bar for brand new tokens so we catch launches fast
+NEW_TOKEN_HOURS = 1    # token < 1h old → alert at 2 fresh wallets
+HOT_TOKEN_HOURS = 6    # token < 6h old → alert at 3 fresh wallets
+                       # token >= 6h     → standard CLUSTER_MIN_WALLETS (5)
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -162,6 +167,23 @@ solana_program_last_sig: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+def dynamic_min_wallets(token_age_hours: float | None) -> int:
+    """
+    Lower the alert threshold for newly launched tokens so we fire fast.
+      < 1h  → 2 wallets  (catch launches the moment they happen)
+      < 6h  → 3 wallets
+      >= 6h → CLUSTER_MIN_WALLETS (5, the normal threshold)
+    Unknown age (DexScreener lookup failed) uses the normal threshold.
+    """
+    if token_age_hours is None:
+        return CLUSTER_MIN_WALLETS
+    if token_age_hours <= NEW_TOKEN_HOURS:
+        return 2
+    if token_age_hours <= HOT_TOKEN_HOURS:
+        return 3
+    return CLUSTER_MIN_WALLETS
+
 
 def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count: int) -> tuple[int, str]:
     """
@@ -400,7 +422,7 @@ def send_telegram(message: str) -> None:
         log.error("Telegram send failed: %s", exc)
 
 
-def build_alert(chain_id: str, token_address: str, buys: list[dict]) -> str:
+def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
     chain = CHAINS[chain_id]
     info = get_token_info(chain_id, token_address)
     token_name = info["name"]
@@ -451,10 +473,20 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict]) -> str:
     summary = " + ".join(summary_parts)
 
     speed_str = f"{speed_count} wallets in first {SPEED_WINDOW_MINUTES}min" if speed_count > 1 else ""
+    if token_age_hours is not None:
+        if token_age_hours < 1:
+            age_str = f"{int(token_age_hours * 60)}min old 🔴"
+        elif token_age_hours < 24:
+            age_str = f"{token_age_hours:.1f}h old"
+        else:
+            age_str = f"{token_age_hours / 24:.1f}d old"
+    else:
+        age_str = ""
 
     return (
         f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}\n\n"
-        f"<b>Token:</b> {token_name} ({token_symbol})\n"
+        f"<b>Token:</b> {token_name} ({token_symbol})"
+        + (f" — <b>{age_str}</b>" if age_str else "") + "\n"
         f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
         f"<b>Wallets:</b> {summary}\n"
         + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
@@ -481,14 +513,16 @@ def prune_old_buys(chain_id: str) -> None:
 def check_for_clusters(chain_id: str) -> None:
     network = CHAINS[chain_id]["dexscreener_network"]
     for token_address, buys in cluster_buys[chain_id].items():
-        if len(buys) < CLUSTER_MIN_WALLETS:
-            continue
-        # Deduplicate by wallet
+        # Deduplicate by wallet first
         seen = {}
         for b in buys:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
-        if len(unique_buys) < CLUSTER_MIN_WALLETS:
+
+        # Use dynamic threshold — lower bar for brand new tokens
+        token_age = get_token_age_hours(token_address, network)
+        min_wallets = dynamic_min_wallets(token_age)
+        if len(unique_buys) < min_wallets:
             continue
 
         if is_token_too_old(token_address, network):
@@ -505,10 +539,10 @@ def check_for_clusters(chain_id: str) -> None:
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
         dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
         log.info(
-            "[%s] CLUSTER: %d fresh + %d dormant wallets bought %s",
-            chain_id, fresh_count, dormant_count, token_address,
+            "[%s] CLUSTER: %d fresh + %d dormant wallets bought %s (age %.1fh)",
+            chain_id, fresh_count, dormant_count, token_address, token_age or -1,
         )
-        message = build_alert(chain_id, token_address, unique_buys)
+        message = build_alert(chain_id, token_address, unique_buys, token_age)
         send_telegram(message)
 
 
@@ -604,6 +638,52 @@ def helius_rpc(method: str, params: list) -> object:
     except Exception as exc:
         log.warning("[solana] Helius RPC %s failed: %s", method, exc)
         return None
+
+
+PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Tracks newly minted Pump.fun tokens so we start watching them immediately
+# token_mint -> mint_timestamp
+pumpfun_new_tokens: dict[str, int] = {}
+pumpfun_last_mint_sig: str = ""
+
+
+def helius_poll_pumpfun_launches() -> int:
+    """
+    Poll Pump.fun program for new token mints (PUMP_FUN_MINT transactions).
+    Registers newly launched tokens in pumpfun_new_tokens so the swap scanner
+    immediately tracks fresh wallet buys on them. Returns count of new launches.
+    """
+    global pumpfun_last_mint_sig
+    params: dict = {"type": "UNKNOWN", "limit": 50}  # Pump.fun mints appear as UNKNOWN type
+    if pumpfun_last_mint_sig:
+        params["until"] = pumpfun_last_mint_sig
+
+    data = helius_get(f"/addresses/{PUMPFUN_PROGRAM}/transactions", params=params)
+    txs = data if isinstance(data, list) else []
+
+    new_count = 0
+    for tx in txs:
+        sig = tx.get("signature", "")
+        if not sig:
+            continue
+        if new_count == 0:
+            pumpfun_last_mint_sig = sig
+
+        # Look for token mint creation in tokenTransfers with no fromUserAccount
+        # (minting from nothing = new token creation)
+        for transfer in tx.get("tokenTransfers", []):
+            mint = transfer.get("mint", "")
+            from_acct = transfer.get("fromUserAccount", "")
+            if mint and not from_acct and mint not in pumpfun_new_tokens:
+                ts = tx.get("timestamp") or NOW_TS()
+                pumpfun_new_tokens[mint] = int(ts)
+                log.info("[solana] NEW Pump.fun launch: %s at %s", mint[:10], datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S UTC"))
+                new_count += 1
+
+        new_count += 1  # count all txs processed for pagination
+
+    return new_count
 
 
 def helius_get_recent_swaps(program_id: str, until_sig: str = "") -> list[dict]:
@@ -790,16 +870,36 @@ def build_solana_alert(token_address: str, buys: list[dict]) -> str:
     )
 
 
+def build_solana_alert_with_age(token_address: str, buys: list[dict], token_age_hours: float | None) -> str:
+    """Wrapper that injects token age into the Solana alert."""
+    base = build_solana_alert(token_address, buys)
+    if token_age_hours is not None:
+        if token_age_hours < 1:
+            age_str = f"{int(token_age_hours * 60)}min old 🔴"
+        elif token_age_hours < 24:
+            age_str = f"{token_age_hours:.1f}h old"
+        else:
+            age_str = f"{token_age_hours / 24:.1f}d old"
+        # Inject after token name line
+        base = base.replace(
+            "\n<b>Address:</b>",
+            f" — <b>{age_str}</b>\n<b>Address:</b>",
+            1,
+        )
+    return base
+
+
 def check_solana_clusters() -> None:
     """Check Solana cluster_buys for alertable clusters."""
     for token_address, buys in cluster_buys["solana"].items():
-        if len(buys) < CLUSTER_MIN_WALLETS:
-            continue
         seen = {}
         for b in buys:
             seen[b["wallet"]] = b
         unique_buys = list(seen.values())
-        if len(unique_buys) < CLUSTER_MIN_WALLETS:
+
+        token_age = get_token_age_hours(token_address, "solana")
+        min_wallets = dynamic_min_wallets(token_age)
+        if len(unique_buys) < min_wallets:
             continue
 
         if is_token_too_old(token_address, "solana"):
@@ -816,10 +916,10 @@ def check_solana_clusters() -> None:
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
         dormant_count = sum(1 for b in unique_buys if b["wallet_type"] == "dormant")
         log.info(
-            "[solana] CLUSTER: %d fresh + %d dormant wallets bought %s",
-            fresh_count, dormant_count, token_address,
+            "[solana] CLUSTER: %d fresh + %d dormant wallets bought %s (age %.1fh)",
+            fresh_count, dormant_count, token_address, token_age or -1,
         )
-        message = build_solana_alert(token_address, unique_buys)
+        message = build_solana_alert_with_age(token_address, unique_buys, token_age)
         send_telegram(message)
 
 
@@ -927,6 +1027,12 @@ def scan_solana() -> None:
     while True:
         total_new = 0
         try:
+            # Check for brand new Pump.fun token launches first
+            new_launches = helius_poll_pumpfun_launches()
+            if new_launches:
+                log.info("[solana] Pump.fun: %d new token launches detected", new_launches)
+            time.sleep(0.5)
+
             for program_id, dex_name in SOLANA_DEX_PROGRAMS.items():
                 until_sig = solana_program_last_sig.get(program_id, "")
                 txs = helius_get_recent_swaps(program_id, until_sig=until_sig)
