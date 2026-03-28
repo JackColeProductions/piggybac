@@ -30,10 +30,10 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-API_KEY = os.getenv("BASESCAN_API_KEY", "")  # works for both Etherscan + Basescan
-SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()
+SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "").strip().strip('"\'')
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
@@ -881,7 +881,8 @@ def prune_solana_old_buys() -> None:
 
 def scan_solana() -> None:
     """Main Solana scanner loop — polls Solscan /token/defi/activities for WSOL swaps."""
-    log.info("[Solana] Starting up... monitoring WSOL swaps on Raydium/Orca/Jupiter/Pump.fun")
+    key_preview = (SOLSCAN_API_KEY[:8] + "..." + SOLSCAN_API_KEY[-4:]) if len(SOLSCAN_API_KEY) > 12 else f"(len={len(SOLSCAN_API_KEY)})"
+    log.info("[Solana] Starting up... API key preview: %s", key_preview)
     _init_solscan_headers()
 
     while True:
