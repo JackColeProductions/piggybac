@@ -1008,9 +1008,11 @@ def check_for_clusters(chain_id: str) -> None:
         if len(unique_buys) < CLUSTER_MIN_WALLETS:
             continue
 
+        log.info("[%s] Potential cluster: %d wallets on %s — checking filters",
+                 chain_id, len(unique_buys), token_address[:10])
         token_age = get_token_age_hours(token_address, network)
         if is_token_too_old(token_address, network):
-            log.debug("[%s] Skipping old token %s", chain_id, token_address[:10])
+            log.info("[%s] SKIP %s — token too old (%.1fh)", chain_id, token_address[:10], token_age or -1)
             continue
 
         fail_reason = token_quality_fail_reason(token_address)
@@ -1439,9 +1441,11 @@ def check_solana_clusters() -> None:
         if len(unique_buys) < CLUSTER_MIN_WALLETS:
             continue
 
+        log.info("[solana] Potential cluster: %d wallets on %s — checking filters",
+                 len(unique_buys), token_address[:10])
         token_age = get_token_age_hours(token_address, "solana")
         if is_token_too_old(token_address, "solana"):
-            log.debug("[solana] Skipping old token %s", token_address[:10])
+            log.info("[solana] SKIP %s — token too old (%.1fh)", token_address[:10], token_age or -1)
             continue
 
         fail_reason = token_quality_fail_reason(token_address)
