@@ -39,10 +39,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
-CLUSTER_MIN_WALLETS = 5                # fresh/dormant wallets needed to alert
+CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction threshold
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
 POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
 TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
+MIN_LIQUIDITY_USD = 5_000             # skip tokens with < $5k liquidity (rug filter)
+MIN_SELLS_H1 = 1                       # skip tokens with 0 sells in last hour (honeypot filter)
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -191,6 +193,12 @@ token_age_cache: dict[str, float | None] = {}
 
 # token_address -> {name, symbol} cached from DexScreener (populated alongside age lookup)
 dexscreener_name_cache: dict[str, dict] = {}
+
+# token_address -> liquidity USD (None = unknown)
+token_liquidity_cache: dict[str, float | None] = {}
+
+# token_address -> sell count in last 1h (None = unknown)
+token_sells_h1_cache: dict[str, int | None] = {}
 
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
@@ -540,6 +548,22 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
                     "symbol": symbol or "???",
                 }
 
+        # Cache liquidity: sum across all pairs
+        if token_address not in token_liquidity_cache:
+            total_liq = 0.0
+            for p in pairs:
+                liq = (p.get("liquidity") or {}).get("usd") or 0
+                total_liq += float(liq)
+            token_liquidity_cache[token_address] = total_liq if total_liq > 0 else None
+
+        # Cache sell count in the last 1h across all pairs
+        if token_address not in token_sells_h1_cache:
+            total_sells = 0
+            for p in pairs:
+                txns = p.get("txns") or {}
+                total_sells += int((txns.get("h1") or {}).get("sells") or 0)
+            token_sells_h1_cache[token_address] = total_sells
+
         # Find the earliest pair creation timestamp (ms → s)
         earliest_ms = min(
             p["pairCreatedAt"] for p in pairs if p.get("pairCreatedAt")
@@ -559,6 +583,23 @@ def is_token_too_old(token_address: str, network: str = "solana") -> bool:
     if age is None:
         return False  # unknown age → allow through rather than silently drop
     return age > TOKEN_MAX_AGE_HOURS
+
+
+def token_quality_fail_reason(token_address: str) -> str | None:
+    """
+    Returns a string describing why a token fails quality checks, or None if it passes.
+    Checks (in order): liquidity, honeypot (no sells).
+    Only applied when DexScreener data is available — unknown = allow through.
+    """
+    liq = token_liquidity_cache.get(token_address)
+    if liq is not None and liq < MIN_LIQUIDITY_USD:
+        return f"low liquidity (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,})"
+
+    sells = token_sells_h1_cache.get(token_address)
+    if sells is not None and sells < MIN_SELLS_H1:
+        return "no sells in last 1h (possible honeypot)"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -643,11 +684,17 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
     else:
         age_str = ""
 
+    liq = token_liquidity_cache.get(token_address)
+    liq_str = f"${liq:,.0f}" if liq is not None else "unknown"
+    sells = token_sells_h1_cache.get(token_address)
+    sells_str = str(sells) if sells is not None else "?"
+
     return (
         f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}\n\n"
         f"<b>Token:</b> {token_name} ({token_symbol})"
         + (f" — <b>{age_str}</b>" if age_str else "") + "\n"
         f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
+        f"<b>Liquidity:</b> {liq_str} | <b>Sells/1h:</b> {sells_str}\n"
         f"<b>Wallets:</b> {summary}\n"
         + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
         + f"\n{wallets_str}\n\n"
@@ -685,6 +732,11 @@ def check_for_clusters(chain_id: str) -> None:
         token_age = get_token_age_hours(token_address, network)
         if is_token_too_old(token_address, network):
             log.debug("[%s] Skipping old token %s", chain_id, token_address[:10])
+            continue
+
+        fail_reason = token_quality_fail_reason(token_address)
+        if fail_reason:
+            log.info("[%s] Skipping token %s — %s", chain_id, token_address[:10], fail_reason)
             continue
 
         # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
@@ -1044,10 +1096,16 @@ def build_solana_alert(token_address: str, buys: list[dict]) -> str:
 
     speed_str = f"{speed_count} wallets in {CLUSTER_TIME_WINDOW_MINUTES}min" if speed_count > 1 else ""
 
+    liq = token_liquidity_cache.get(token_address)
+    liq_str = f"${liq:,.0f}" if liq is not None else "unknown"
+    sells = token_sells_h1_cache.get(token_address)
+    sells_str = str(sells) if sells is not None else "?"
+
     return (
         f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}\n\n"
         f"<b>Token:</b> {token_name} ({token_symbol})\n"
         f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
+        f"<b>Liquidity:</b> {liq_str} | <b>Sells/1h:</b> {sells_str}\n"
         f"<b>Wallets:</b> {summary}\n"
         + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
         + f"\n{wallets_str}\n\n"
@@ -1089,6 +1147,11 @@ def check_solana_clusters() -> None:
         token_age = get_token_age_hours(token_address, "solana")
         if is_token_too_old(token_address, "solana"):
             log.debug("[solana] Skipping old token %s", token_address[:10])
+            continue
+
+        fail_reason = token_quality_fail_reason(token_address)
+        if fail_reason:
+            log.info("[solana] Skipping token %s — %s", token_address[:10], fail_reason)
             continue
 
         # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
