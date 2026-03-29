@@ -943,6 +943,39 @@ def _send_performance_review(token_address: str, review: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_dexscreener_price(token_address: str) -> tuple[float | None, float | None, int | None]:
+    """Fetch (price, mcap, buys_5m) from DexScreener. Returns (None, None, None) on failure."""
+    r = requests.get(
+        f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+        timeout=8,
+    )
+    r.raise_for_status()
+    pairs = r.json().get("pairs") or []
+    if not pairs:
+        return None, None, None
+    best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+    price = best.get("priceUsd")
+    mcap = best.get("marketCap") or best.get("fdv")
+    txns = best.get("txns") or {}
+    buys_5m = int((txns.get("m5") or {}).get("buys") or 0)
+    return (float(price) if price else None), (float(mcap) if mcap else None), buys_5m
+
+
+def _price_verdict(alert_price: float, current_price: float) -> str:
+    pct = (current_price - alert_price) / alert_price * 100
+    if pct >= 100:
+        return f"🚀 +{pct:.1f}% — confirmed move!"
+    if pct >= 20:
+        return f"🚀 +{pct:.1f}% — confirmed move!"
+    if pct >= 5:
+        return f"📈 +{pct:.1f}% — up"
+    if pct >= -5:
+        return f"😐 {pct:+.1f}% — flat"
+    if pct >= -20:
+        return f"📉 {pct:.1f}% — fading"
+    return f"💀 {pct:.1f}% — dumping"
+
+
 def schedule_confirmation_ping(
     token_address: str,
     network: str,
@@ -952,61 +985,41 @@ def schedule_confirmation_ping(
     recipient_msg_ids: dict[str, int],
 ) -> None:
     """
-    Spawn a daemon thread that sleeps CONFIRM_PING_DELAY_SECONDS (3 min), then
-    refetches DexScreener and sends a brief price-check reply to the original alert.
+    Spawn daemon threads for 3min, 15min, and 30min price checks.
+    Each check replies to the original alert message.
     """
-    def _ping() -> None:
-        time.sleep(CONFIRM_PING_DELAY_SECONDS)
+    def _ping(delay_seconds: int, label: str) -> None:
+        time.sleep(delay_seconds)
         try:
-            current_price: float | None = None
-            current_mcap: float | None = None
-            buys_5m: int | None = None
+            current_price, current_mcap, buys_5m = None, None, None
             try:
-                r = requests.get(
-                    f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
-                    timeout=8,
-                )
-                r.raise_for_status()
-                pairs = r.json().get("pairs") or []
-                if pairs:
-                    best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
-                    p = best.get("priceUsd")
-                    m = best.get("marketCap") or best.get("fdv")
-                    current_price = float(p) if p else None
-                    current_mcap = float(m) if m else None
-                    txns = best.get("txns") or {}
-                    buys_5m = int((txns.get("m5") or {}).get("buys") or 0)
+                current_price, current_mcap, buys_5m = _fetch_dexscreener_price(token_address)
             except Exception as exc:
                 log.warning("[ping] DexScreener fetch failed for %s: %s", token_address[:10], exc)
 
             if alert_price and current_price:
-                pct = (current_price - alert_price) / alert_price * 100
-                if pct >= 20:
-                    verdict = f"🚀 +{pct:.1f}% — confirmed move!"
-                elif pct >= 5:
-                    verdict = f"📈 +{pct:.1f}% — up"
-                elif pct >= -5:
-                    verdict = f"😐 {pct:+.1f}% — flat"
-                elif pct >= -20:
-                    verdict = f"📉 {pct:.1f}% — fading"
-                else:
-                    verdict = f"💀 {pct:.1f}% — dumping"
+                verdict = _price_verdict(alert_price, current_price)
             else:
                 verdict = "❓ Price N/A"
 
             buys_str = f"  |  Buys/5min: {buys_5m}" if buys_5m is not None else ""
             msg = (
-                f"⏱ <b>3min check</b> — {token_name}\n"
+                f"⏱ <b>{label}</b> — {token_name}\n"
                 f"Price: {fmt_price(current_price)} (was {fmt_price(alert_price)})\n"
                 f"MCap: {fmt_mcap(current_mcap)}{buys_str}\n"
                 f"<b>{verdict}</b>"
             )
             send_telegram(msg, reply_to_message_ids=recipient_msg_ids)
-            log.info("[ping] 3min check sent for %s: %s", token_name, verdict)
+            log.info("[ping] %s sent for %s: %s", label, token_name, verdict)
         except Exception as exc:
-            log.warning("[ping] Confirmation ping failed for %s: %s", token_address[:10], exc)
+            log.warning("[ping] %s failed for %s: %s", label, token_address[:10], exc)
 
-    threading.Thread(target=_ping, daemon=True).start()
+    for delay, label in [
+        (3 * 60,  "3min check"),
+        (15 * 60, "15min check"),
+        (30 * 60, "30min check"),
+    ]:
+        threading.Thread(target=_ping, args=(delay, label), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
