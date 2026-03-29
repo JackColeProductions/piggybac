@@ -219,6 +219,9 @@ token_buys_h1_cache: dict[str, int | None] = {}
 # token_address -> {"website": url|None, "twitter": url|None}
 token_socials_cache: dict[str, dict] = {}
 
+# token_address -> top-10-holder % (float 0-100) or None
+token_top_holders_cache: dict[str, float | None] = {}
+
 # Tokens awaiting 24h performance review
 # token_address -> {chain_id, network, alert_ts, price_usd, mcap_usd, token_name, token_symbol, explorer_url}
 pending_reviews: dict[str, dict] = {}
@@ -943,6 +946,68 @@ def _send_performance_review(token_address: str, review: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Top holder concentration
+# ---------------------------------------------------------------------------
+
+def get_top_holder_pct(token_address: str, chain_id: str) -> float | None:
+    """
+    Return the % of supply held by the top 10 wallets. Cached.
+    Solana: Helius RPC getTokenLargestAccounts + getTokenSupply.
+    EVM: Basescan/Etherscan tokenholderlist + tokensupply.
+    """
+    if token_address in token_top_holders_cache:
+        return token_top_holders_cache[token_address]
+
+    pct: float | None = None
+    try:
+        if chain_id == "solana":
+            largest = helius_rpc("getTokenLargestAccounts", [token_address])
+            supply_res = helius_rpc("getTokenSupply", [token_address])
+            if largest and supply_res:
+                accounts = (largest.get("value") or [])[:10]
+                total = float((supply_res.get("value") or {}).get("uiAmount") or 0)
+                if total > 0:
+                    top10 = sum(float(a.get("uiAmount") or 0) for a in accounts)
+                    pct = (top10 / total) * 100
+        else:
+            # EVM — use Basescan (Base) or Etherscan (Ethereum)
+            if chain_id == "base":
+                api_url, api_key = "https://api.basescan.org/api", API_KEY
+            else:
+                api_url = "https://api.etherscan.io/api"
+                api_key = os.getenv("ETHERSCAN_API_KEY", "").strip()
+            if api_key:
+                r = requests.get(api_url, params={
+                    "module": "token", "action": "tokenholderlist",
+                    "contractaddress": token_address,
+                    "page": 1, "offset": 10, "apikey": api_key,
+                }, timeout=8)
+                r.raise_for_status()
+                holders = r.json().get("result") or []
+                r2 = requests.get(api_url, params={
+                    "module": "stats", "action": "tokensupply",
+                    "contractaddress": token_address, "apikey": api_key,
+                }, timeout=8)
+                r2.raise_for_status()
+                total_raw = int(r2.json().get("result") or 0)
+                if holders and total_raw > 0:
+                    top10_raw = sum(int(h.get("TokenHolderQuantity") or 0) for h in holders)
+                    pct = (top10_raw / total_raw) * 100
+    except Exception as exc:
+        log.debug("[%s] Top holder lookup failed for %s: %s", chain_id, token_address[:10], exc)
+
+    token_top_holders_cache[token_address] = pct
+    return pct
+
+
+def _fmt_top_holders(pct: float | None) -> str:
+    if pct is None:
+        return ""
+    flag = " 🚨" if pct >= 80 else (" ⚠️" if pct >= 60 else "")
+    return f"Top 10 Hold: {pct:.0f}%{flag}"
+
+
 def _fetch_dexscreener_price(token_address: str) -> tuple[float | None, float | None, int | None]:
     """Fetch (price, mcap, buys_5m) from DexScreener. Returns (None, None, None) on failure."""
     r = requests.get(
@@ -1232,6 +1297,7 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
     token_name = info["name"]
     token_symbol = info["symbol"]
     explorer_url = f"{chain['explorer_url']}/token/{token_address}"
+    top_holders_str = _fmt_top_holders(token_top_holders_cache.get(token_address))
     dexscreener_url = f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}"
     chain_label = chain["name"]
 
@@ -1272,12 +1338,15 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
 
     extra_signals = _gather_alert_signals(token_name, token_address, chain_id, buys)
 
+    liq_line = f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}"
+    if top_holders_str:
+        liq_line += f"  |  {top_holders_str}"
     lines = [
         f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}",
         "",
         f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
         f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
-        f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}",
+        liq_line,
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
@@ -1340,6 +1409,7 @@ def check_for_clusters(chain_id: str) -> None:
             "[%s] CLUSTER: %d fresh + %d dormant wallets bought %s (age %.1fh)",
             chain_id, fresh_count, dormant_count, token_address, token_age or -1,
         )
+        get_top_holder_pct(token_address, chain_id)  # populate cache before alert
         message = build_alert(chain_id, token_address, unique_buys, token_age)
         chain = CHAINS[chain_id]
         keyboard = make_alert_keyboard(
@@ -1707,6 +1777,7 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
     buys_1h = token_buys_h1_cache.get(token_address)
     mcap = token_mcap_cache.get(token_address)
     price = token_price_cache.get(token_address)
+    top_holders_str = _fmt_top_holders(token_top_holders_cache.get(token_address))
 
     wallet_lines = []
     for b in fresh_buys:
@@ -1728,12 +1799,15 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
 
     extra_signals = _gather_alert_signals(token_name, token_address, "solana", buys)
 
+    liq_line = f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}"
+    if top_holders_str:
+        liq_line += f"  |  {top_holders_str}"
     lines = [
         f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}",
         "",
         f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
         f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
-        f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}",
+        liq_line,
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
@@ -1786,6 +1860,7 @@ def check_solana_clusters() -> None:
             "[solana] CLUSTER: %d fresh + %d dormant wallets bought %s (age %.1fh)",
             fresh_count, dormant_count, token_address, token_age or -1,
         )
+        get_top_holder_pct(token_address, "solana")  # populate cache before alert
         message = build_solana_alert_with_age(token_address, unique_buys, token_age)
         is_pump = any(b.get("dex") == "Pump.fun" for b in unique_buys)
         keyboard = make_alert_keyboard(
