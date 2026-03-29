@@ -206,6 +206,12 @@ token_price_cache: dict[str, float | None] = {}
 # token_address -> market cap USD at time of first DexScreener lookup
 token_mcap_cache: dict[str, float | None] = {}
 
+# token_address -> buy count in last 1h (from DexScreener txns.h1.buys)
+token_buys_h1_cache: dict[str, int | None] = {}
+
+# token_address -> {"website": url|None, "twitter": url|None}
+token_socials_cache: dict[str, dict] = {}
+
 # Tokens awaiting 24h performance review
 # token_address -> {chain_id, network, alert_ts, price_usd, mcap_usd, token_name, token_symbol, explorer_url}
 pending_reviews: dict[str, dict] = {}
@@ -219,6 +225,28 @@ solana_program_last_sig: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+def fmt_price(v: float | None) -> str:
+    """Format a USD price for display."""
+    if v is None:
+        return "N/A"
+    if v < 0.000001:
+        return f"${v:.2e}"
+    if v < 0.01:
+        return f"${v:.8f}"
+    return f"${v:,.4f}"
+
+
+def fmt_mcap(v: float | None) -> str:
+    """Format a USD market cap for display."""
+    if v is None:
+        return "N/A"
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.1f}K"
+    return f"${v:,.0f}"
+
 
 def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count: int) -> tuple[int, str]:
     """
@@ -573,21 +601,36 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
                 total_liq += float(liq)
             token_liquidity_cache[token_address] = total_liq if total_liq > 0 else None
 
-        # Cache sell count in the last 1h across all pairs
+        # Cache sell + buy count in the last 1h across all pairs
         if token_address not in token_sells_h1_cache:
             total_sells = 0
+            total_buys = 0
             for p in pairs:
                 txns = p.get("txns") or {}
                 total_sells += int((txns.get("h1") or {}).get("sells") or 0)
+                total_buys += int((txns.get("h1") or {}).get("buys") or 0)
             token_sells_h1_cache[token_address] = total_sells
+            token_buys_h1_cache[token_address] = total_buys if total_buys > 0 else None
 
-        # Cache price and market cap from highest-liquidity pair
+        # Cache price, market cap, and socials from highest-liquidity pair
         if token_address not in token_price_cache:
             best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
             price = best.get("priceUsd")
             mcap = best.get("marketCap") or best.get("fdv")
             token_price_cache[token_address] = float(price) if price else None
             token_mcap_cache[token_address] = float(mcap) if mcap else None
+
+            # Social links from DexScreener pair info block
+            info_block = best.get("info") or {}
+            website = next(
+                (w.get("url") for w in (info_block.get("websites") or []) if w.get("url")),
+                None,
+            )
+            twitter = next(
+                (s.get("url") for s in (info_block.get("socials") or []) if s.get("type") == "twitter" and s.get("url")),
+                None,
+            )
+            token_socials_cache[token_address] = {"website": website, "twitter": twitter}
 
         # Find the earliest pair creation timestamp (ms → s)
         earliest_ms = min(
@@ -700,24 +743,6 @@ def _send_performance_review(token_address: str, review: dict) -> None:
     except Exception as exc:
         log.warning("[review] DexScreener fetch failed for %s: %s", token_address[:10], exc)
 
-    def fmt_price(v):
-        if v is None:
-            return "N/A"
-        if v < 0.000001:
-            return f"${v:.2e}"
-        if v < 0.01:
-            return f"${v:.8f}"
-        return f"${v:,.4f}"
-
-    def fmt_mcap(v):
-        if v is None:
-            return "N/A"
-        if v >= 1_000_000:
-            return f"${v/1_000_000:.2f}M"
-        if v >= 1_000:
-            return f"${v/1_000:.1f}K"
-        return f"${v:,.0f}"
-
     # Calculate change
     if entry_price and current_price:
         pct = (current_price - entry_price) / entry_price * 100
@@ -731,11 +756,14 @@ def _send_performance_review(token_address: str, review: dict) -> None:
         f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n\n"
         f"<b>At alert:</b>  Price {fmt_price(entry_price)} | MCap {fmt_mcap(entry_mcap)}\n"
         f"<b>Now:</b>       Price {fmt_price(current_price)} | MCap {fmt_mcap(current_mcap)}\n\n"
-        f"<b>Performance: {pct_str}</b>\n\n"
-        f"<a href='{dexscreener_url}'>DexScreener</a> | <a href='{explorer_url}'>Explorer</a>"
+        f"<b>Performance: {pct_str}</b>"
+    )
+    keyboard = make_alert_keyboard(
+        dexscreener_url=dexscreener_url,
+        explorer_url=explorer_url,
     )
     log.info("[review] Sending 24h review for %s: %s", name, pct_str)
-    send_telegram(msg)
+    send_telegram(msg, reply_markup=keyboard)
 
 
 # ---------------------------------------------------------------------------
@@ -748,17 +776,21 @@ def _send_performance_review(token_address: str, review: dict) -> None:
 telegram_subscribers: set[str] = set()
 
 
-def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML") -> None:
+def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML", reply_markup: dict | None = None) -> None:
     """Send a single Telegram message to one chat_id."""
+    import json as _json
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = _json.dumps(reply_markup)
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            },
+            json=payload,
             timeout=10,
         )
         r.raise_for_status()
@@ -766,7 +798,7 @@ def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML") -> None:
         log.error("Telegram send to %s failed: %s", chat_id, exc)
 
 
-def send_telegram(message: str) -> None:
+def send_telegram(message: str, reply_markup: dict | None = None) -> None:
     """Broadcast an alert to all subscribers."""
     if not TELEGRAM_BOT_TOKEN:
         log.warning("Telegram not configured — skipping alert")
@@ -777,7 +809,7 @@ def send_telegram(message: str) -> None:
         log.warning("No Telegram subscribers yet — skipping alert")
         return
     for chat_id in recipients:
-        _tg_send(chat_id, message)
+        _tg_send(chat_id, message, reply_markup=reply_markup)
 
 
 def poll_telegram_commands() -> None:
@@ -836,23 +868,80 @@ def poll_telegram_commands() -> None:
             time.sleep(5)
 
 
+def make_alert_keyboard(
+    dexscreener_url: str,
+    explorer_url: str,
+    pump_fun_url: str | None = None,
+    socials: dict | None = None,
+) -> dict:
+    """Build a Telegram inline keyboard with URL buttons for an alert."""
+    row1 = [
+        {"text": "📊 Chart", "url": dexscreener_url},
+        {"text": "🔍 Explorer", "url": explorer_url},
+    ]
+    if pump_fun_url:
+        row1.append({"text": "🌊 Pump.fun", "url": pump_fun_url})
+    rows = [row1]
+    if socials:
+        row2 = []
+        if socials.get("website"):
+            row2.append({"text": "🌐 Website", "url": socials["website"]})
+        if socials.get("twitter"):
+            row2.append({"text": "🐦 Twitter", "url": socials["twitter"]})
+        if row2:
+            rows.append(row2)
+    return {"inline_keyboard": rows}
+
+
+def _format_age(token_age_hours: float | None) -> str:
+    if token_age_hours is None:
+        return ""
+    if token_age_hours < 1:
+        return f"{int(token_age_hours * 60)}min old 🔴"
+    if token_age_hours < 24:
+        return f"{token_age_hours:.1f}h old"
+    return f"{token_age_hours / 24:.1f}d old"
+
+
+def _cex_diversity_note(buys: list[dict]) -> str:
+    """Return a note about CEX funding diversity in the cluster."""
+    sources = [b.get("funding_source") for b in buys if b.get("wallet_type") == "fresh"]
+    known = [s for s in sources if s and s.lower() not in ("unknown", "none")]
+    unique_cexes = len(set(known))
+    all_unknown = all(s is None or s.lower() in ("unknown", "none") for s in sources)
+    if unique_cexes >= 3:
+        return f"✅ {unique_cexes} different CEXes funded these wallets"
+    if unique_cexes >= 2:
+        return f"⚡ {unique_cexes} different CEXes"
+    if all_unknown and sources:
+        return "⚠️ All funding sources unknown"
+    return ""
+
+
 def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
     chain = CHAINS[chain_id]
     info = get_token_info(chain_id, token_address)
     token_name = info["name"]
     token_symbol = info["symbol"]
-    short_addr = token_address[:6] + "..." + token_address[-4:]
     explorer_url = f"{chain['explorer_url']}/token/{token_address}"
-    dexscreener_url = (
-        f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}"
-    )
+    dexscreener_url = f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}"
+    chain_label = chain["name"]
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
-
-    # All buys are already within CLUSTER_TIME_WINDOW_MINUTES by definition
     speed_count = len(buys)
-    score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
+    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), speed_count, speed_count)
+
+    age_str = _format_age(token_age_hours)
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    # Market data
+    liq = token_liquidity_cache.get(token_address)
+    liq_str = f"${liq:,.0f}" if liq is not None else "?"
+    sells = token_sells_h1_cache.get(token_address)
+    buys_1h = token_buys_h1_cache.get(token_address)
+    mcap = token_mcap_cache.get(token_address)
+    price = token_price_cache.get(token_address)
 
     # Wallet lines — fresh first, then dormant
     wallet_lines = []
@@ -860,54 +949,37 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
         funding = b.get("funding_source") or "unknown"
         tx_url = f"{chain['explorer_url']}/tx/{b['tx_hash']}"
-        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> (funded via {funding})")
-
+        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> ({funding})")
     for b in dormant_buys:
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
         tx_url = f"{chain['explorer_url']}/tx/{b['tx_hash']}"
         inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
         wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
 
-    wallets_str = "\n".join(wallet_lines)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    chain_label = chain["name"]
-
-    # Summary line
+    # Summary header
     summary_parts = []
     if fresh_buys:
         summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
     if dormant_buys:
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
-    summary = " + ".join(summary_parts)
 
-    speed_str = f"{speed_count} wallets in {CLUSTER_TIME_WINDOW_MINUTES}min" if speed_count > 1 else ""
-    if token_age_hours is not None:
-        if token_age_hours < 1:
-            age_str = f"{int(token_age_hours * 60)}min old 🔴"
-        elif token_age_hours < 24:
-            age_str = f"{token_age_hours:.1f}h old"
-        else:
-            age_str = f"{token_age_hours / 24:.1f}d old"
-    else:
-        age_str = ""
+    cex_note = _cex_diversity_note(buys)
 
-    liq = token_liquidity_cache.get(token_address)
-    liq_str = f"${liq:,.0f}" if liq is not None else "unknown"
-    sells = token_sells_h1_cache.get(token_address)
-    sells_str = str(sells) if sells is not None else "?"
+    lines = [
+        f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}",
+        "",
+        f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
+        f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
+        f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}",
+        "",
+        f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
+    ]
+    if cex_note:
+        lines.append(cex_note)
+    lines.append("")
+    lines.extend(wallet_lines)
 
-    return (
-        f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}\n\n"
-        f"<b>Token:</b> {token_name} ({token_symbol})"
-        + (f" — <b>{age_str}</b>" if age_str else "") + "\n"
-        f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
-        f"<b>Liquidity:</b> {liq_str} | <b>Sells/1h:</b> {sells_str}\n"
-        f"<b>Wallets:</b> {summary}\n"
-        + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
-        + f"\n{wallets_str}\n\n"
-        f"<a href='{dexscreener_url}'>DexScreener</a> | "
-        f"<a href='{explorer_url}'>Explorer</a>"
-    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +1031,13 @@ def check_for_clusters(chain_id: str) -> None:
             chain_id, fresh_count, dormant_count, token_address, token_age or -1,
         )
         message = build_alert(chain_id, token_address, unique_buys, token_age)
-        send_telegram(message)
+        chain = CHAINS[chain_id]
+        keyboard = make_alert_keyboard(
+            dexscreener_url=f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}",
+            explorer_url=f"{chain['explorer_url']}/token/{token_address}",
+            socials=token_socials_cache.get(token_address),
+        )
+        send_telegram(message, reply_markup=keyboard)
         info = get_token_info(chain_id, token_address)
         schedule_performance_review(
             token_address, chain_id, CHAINS[chain_id]["dexscreener_network"],
@@ -1283,81 +1361,71 @@ def get_solana_token_info(token_mint: str) -> dict:
     return info
 
 
-def build_solana_alert(token_address: str, buys: list[dict]) -> str:
+def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
     """Build a Telegram alert message for a Solana token cluster."""
     info = get_solana_token_info(token_address)
     token_name = info["name"]
     token_symbol = info["symbol"]
-    short_addr = token_address[:6] + "..." + token_address[-4:]
     explorer_url = f"https://solscan.io/token/{token_address}"
-    dexscreener_url = f"https://dexscreener.com/solana/{token_address}"
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
+    speed_count = len(buys)
+    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), speed_count, speed_count)
 
-    speed_count = len(buys)  # all buys are within the 10-min window
-    score, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), speed_count)
+    age_str = _format_age(token_age_hours)
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
+    # Market data
+    liq = token_liquidity_cache.get(token_address)
+    liq_str = f"${liq:,.0f}" if liq is not None else "?"
+    sells = token_sells_h1_cache.get(token_address)
+    buys_1h = token_buys_h1_cache.get(token_address)
+    mcap = token_mcap_cache.get(token_address)
+    price = token_price_cache.get(token_address)
+
+    # Wallet lines — fresh first, then dormant
     wallet_lines = []
     for b in fresh_buys:
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
         funding = b.get("funding_source") or "unknown"
         tx_url = f"https://solscan.io/tx/{b['tx_hash']}"
-        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> (funded via {funding})")
-
+        wallet_lines.append(f"  🆕 <a href='{tx_url}'>{short_w}</a> ({funding})")
     for b in dormant_buys:
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
         tx_url = f"https://solscan.io/tx/{b['tx_hash']}"
         inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
         wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
 
-    wallets_str = "\n".join(wallet_lines)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
+    # Summary + CEX diversity
     summary_parts = []
     if fresh_buys:
         summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
     if dormant_buys:
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
-    summary = " + ".join(summary_parts)
 
-    speed_str = f"{speed_count} wallets in {CLUSTER_TIME_WINDOW_MINUTES}min" if speed_count > 1 else ""
+    cex_note = _cex_diversity_note(buys)
 
-    liq = token_liquidity_cache.get(token_address)
-    liq_str = f"${liq:,.0f}" if liq is not None else "unknown"
-    sells = token_sells_h1_cache.get(token_address)
-    sells_str = str(sells) if sells is not None else "?"
+    lines = [
+        f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}",
+        "",
+        f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
+        f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
+        f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}",
+        "",
+        f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
+    ]
+    if cex_note:
+        lines.append(cex_note)
+    lines.append("")
+    lines.extend(wallet_lines)
 
-    return (
-        f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}\n\n"
-        f"<b>Token:</b> {token_name} ({token_symbol})\n"
-        f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n"
-        f"<b>Liquidity:</b> {liq_str} | <b>Sells/1h:</b> {sells_str}\n"
-        f"<b>Wallets:</b> {summary}\n"
-        + (f"<b>Speed:</b> {speed_str}\n" if speed_str else "")
-        + f"\n{wallets_str}\n\n"
-        f"<a href='{dexscreener_url}'>DexScreener</a> | "
-        f"<a href='{explorer_url}'>Solscan</a>"
-    )
+    return "\n".join(lines)
 
 
 def build_solana_alert_with_age(token_address: str, buys: list[dict], token_age_hours: float | None) -> str:
-    """Wrapper that injects token age into the Solana alert."""
-    base = build_solana_alert(token_address, buys)
-    if token_age_hours is not None:
-        if token_age_hours < 1:
-            age_str = f"{int(token_age_hours * 60)}min old 🔴"
-        elif token_age_hours < 24:
-            age_str = f"{token_age_hours:.1f}h old"
-        else:
-            age_str = f"{token_age_hours / 24:.1f}d old"
-        # Inject after token name line
-        base = base.replace(
-            "\n<b>Address:</b>",
-            f" — <b>{age_str}</b>\n<b>Address:</b>",
-            1,
-        )
-    return base
+    """Compatibility wrapper — delegates to build_solana_alert with age argument."""
+    return build_solana_alert(token_address, buys, token_age_hours)
 
 
 def check_solana_clusters() -> None:
@@ -1394,7 +1462,14 @@ def check_solana_clusters() -> None:
             fresh_count, dormant_count, token_address, token_age or -1,
         )
         message = build_solana_alert_with_age(token_address, unique_buys, token_age)
-        send_telegram(message)
+        is_pump = any(b.get("dex") == "Pump.fun" for b in unique_buys)
+        keyboard = make_alert_keyboard(
+            dexscreener_url=f"https://dexscreener.com/solana/{token_address}",
+            explorer_url=f"https://solscan.io/token/{token_address}",
+            pump_fun_url=f"https://pump.fun/coin/{token_address}" if is_pump else None,
+            socials=token_socials_cache.get(token_address),
+        )
+        send_telegram(message, reply_markup=keyboard)
         info = get_solana_token_info(token_address)
         schedule_performance_review(
             token_address, "solana", "solana",
