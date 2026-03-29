@@ -38,7 +38,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
-DORMANT_WALLET_MIN_INACTIVE_DAYS = 180 # last active 6+ months ago = dormant
+DORMANT_WALLET_MIN_INACTIVE_DAYS = 90  # last active 3+ months ago = dormant (ETH wallets rarely hit 180d)
 CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction threshold
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
 POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
@@ -342,6 +342,9 @@ def get_pool_tokens(chain_id: str, pool_address: str) -> tuple[str, str] | None:
     if t0 and t1:
         cache[addr] = (t0, t1)
         return (t0, t1)
+    # Pool doesn't have token0()/token1() — not a standard Uni V2/V3 pool (Curve, Balancer, etc.)
+    log.debug("[%s] pool %s has no token0/token1 — skipping", chain_id, pool_address[:10])
+    cache[addr] = None  # type: ignore[assignment]  # cache miss to avoid re-querying
     return None
 
 
@@ -797,6 +800,14 @@ def poll_telegram_commands() -> None:
                 params={"offset": offset, "timeout": 30},
                 timeout=35,
             )
+
+            # 409 = another instance is already polling (Railway rolling deploy).
+            # Back off and let the old instance die before retrying.
+            if r.status_code == 409:
+                log.warning("[Telegram] 409 Conflict — another instance polling, waiting 30s")
+                time.sleep(30)
+                continue
+
             r.raise_for_status()
             for update in r.json().get("result", []):
                 offset = update["update_id"] + 1
