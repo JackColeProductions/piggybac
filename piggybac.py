@@ -43,7 +43,7 @@ CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction thr
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
 POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
 TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
-MIN_LIQUIDITY_USD = 5_000             # skip tokens with < $5k liquidity (rug filter)
+MIN_LIQUIDITY_USD = 2_000             # skip tokens with < $2k liquidity (Pump.fun starts near zero)
 MIN_SELLS_H1 = 1                       # skip tokens with 0 sells in last hour (honeypot filter)
 
 ERC20_TRANSFER_TOPIC = (
