@@ -406,15 +406,16 @@ def decode_swap_log(chain_id: str, log: dict) -> tuple[str, str] | None:
     return (recipient, bought)
 
 
-def _alchemy_asset_transfers(chain_id: str, direction: str, address: str, order: str = "asc") -> list[dict]:
-    """Helper: get 1 asset transfer in `direction` (fromAddress/toAddress) order."""
+def _alchemy_asset_transfers(chain_id: str, direction: str, address: str,
+                              order: str = "asc", max_count: int = 1) -> list[dict]:
+    """Helper: get asset transfers in `direction` (fromAddress/toAddress) for an address."""
     result = alchemy_rpc(chain_id, "alchemy_getAssetTransfers", [{
         direction: address,
         "fromBlock": "0x0",
         "toBlock": "latest",
         "category": ["external", "erc20"],
         "withMetadata": True,
-        "maxCount": "0x5",
+        "maxCount": hex(max_count),
         "order": order,
     }])
     if result and "transfers" in result:
@@ -422,65 +423,68 @@ def _alchemy_asset_transfers(chain_id: str, direction: str, address: str, order:
     return []
 
 
-def get_wallet_timestamps(chain_id: str, address: str) -> dict | None:
-    """
-    Returns {first_ts, last_ts} for a wallet via Alchemy. Cached.
-    Uses alchemy_getAssetTransfers to find first and last activity.
-    """
-    cache = wallet_cache[chain_id]
-    if address in cache:
-        return cache[address]
+# Negative wallet cache — wallets confirmed not fresh/dormant in this session.
+# Skip immediately to avoid re-querying Alchemy for every repeat encounter.
+wallet_skip_cache: set[str] = set()
 
-    # First activity: earliest incoming ETH (wallet creation/funding)
-    first_in = _alchemy_asset_transfers(chain_id, "toAddress", address, "asc")
-    # Also check first outgoing (in case wallet sent before received)
-    first_out = _alchemy_asset_transfers(chain_id, "fromAddress", address, "asc")
 
-    candidates_first = []
-    for t in first_in + first_out:
+def _extract_ts(transfers: list[dict]) -> int | None:
+    """Pull the first valid blockTimestamp from a transfer list."""
+    for t in transfers:
         ts_str = (t.get("metadata") or {}).get("blockTimestamp", "")
         if ts_str:
-            candidates_first.append(_parse_alchemy_ts(ts_str))
-
-    if not candidates_first:
-        return None
-
-    first_ts = min(candidates_first)
-
-    # Last activity: most recent outgoing transfer
-    last_out = _alchemy_asset_transfers(chain_id, "fromAddress", address, "desc")
-    last_in  = _alchemy_asset_transfers(chain_id, "toAddress", address, "desc")
-    candidates_last = []
-    for t in last_out + last_in:
-        ts_str = (t.get("metadata") or {}).get("blockTimestamp", "")
-        if ts_str:
-            candidates_last.append(_parse_alchemy_ts(ts_str))
-
-    last_ts = max(candidates_last) if candidates_last else first_ts
-
-    result = {"first_ts": first_ts, "last_ts": last_ts}
-    cache[address] = result
-    return result
+            return _parse_alchemy_ts(ts_str)
+    return None
 
 
 def classify_wallet(chain_id: str, address: str) -> str | None:
     """
     Returns 'fresh', 'dormant', or None (not interesting).
-    - fresh: first tx <24h ago
-    - dormant: last tx >180 days ago, but now active again
+    Optimised to use 1 Alchemy call for fresh wallets, 2 for dormant checks.
+    Results are cached; uninteresting wallets go into wallet_skip_cache.
     """
-    ts = get_wallet_timestamps(chain_id, address)
-    if not ts:
+    if address in wallet_skip_cache:
+        return None
+
+    cache = wallet_cache[chain_id]
+    if address in cache:
+        ts = cache[address]
+        now = NOW_TS()
+        if (now - ts["first_ts"]) / 3600 <= FRESH_WALLET_MAX_AGE_HOURS:
+            return "fresh"
+        if (now - ts["last_ts"]) / 86400 >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
+            return "dormant"
+        wallet_skip_cache.add(address)
         return None
 
     now = NOW_TS()
-    age_hours = (now - ts["first_ts"]) / 3600
-    inactive_days = (now - ts["last_ts"]) / 86400
 
+    # --- Step 1: one call to get earliest incoming tx (cheapest freshness check) ---
+    first_ts = _extract_ts(_alchemy_asset_transfers(chain_id, "toAddress", address, "asc", 1))
+    if first_ts is None:
+        # Fallback: wallet may have only sent, never received (rare)
+        first_ts = _extract_ts(_alchemy_asset_transfers(chain_id, "fromAddress", address, "asc", 1))
+    if first_ts is None:
+        wallet_skip_cache.add(address)
+        return None
+
+    age_hours = (now - first_ts) / 3600
     if age_hours <= FRESH_WALLET_MAX_AGE_HOURS:
+        # Fresh — cache and return without further calls
+        cache[address] = {"first_ts": first_ts, "last_ts": now}
         return "fresh"
-    if inactive_days >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
+
+    # --- Step 2: one more call to check dormant (last outgoing tx) ---
+    last_ts = _extract_ts(_alchemy_asset_transfers(chain_id, "fromAddress", address, "desc", 1))
+    if last_ts is None:
+        last_ts = first_ts
+
+    cache[address] = {"first_ts": first_ts, "last_ts": last_ts}
+
+    if (now - last_ts) / 86400 >= DORMANT_WALLET_MIN_INACTIVE_DAYS:
         return "dormant"
+
+    wallet_skip_cache.add(address)
     return None
 
 
@@ -959,14 +963,22 @@ def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
     is a fresh/dormant wallet, and record it for cluster detection.
     """
     now = NOW_TS()
+    dex_routers_lower = {k.lower() for k in CHAINS[chain_id]["dex_routers"]}
+    decoded_count = 0
+    interesting_count = 0
 
     for swap_log in swap_logs:
         decoded = decode_swap_log(chain_id, swap_log)
         if not decoded:
             continue
+        decoded_count += 1
 
         wallet, token_address = decoded
         tx_hash = swap_log.get("transactionHash", "")
+
+        # Skip if recipient is a known DEX router/aggregator, not a human wallet
+        if wallet in dex_routers_lower:
+            continue
 
         wallet_type = classify_wallet(chain_id, wallet)
         if wallet_type is None:
@@ -986,6 +998,7 @@ def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
             "[%s] %s wallet buy (uni%s): wallet=%s token=%s",
             chain_id, wallet_type, version, wallet[:10], token_address[:10],
         )
+        interesting_count += 1
 
         cluster_buys[chain_id][token_address].append({
             "wallet": wallet,
@@ -995,6 +1008,11 @@ def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
             "tx_hash": tx_hash,
             "funding_source": funding_source,
         })
+
+    log.info(
+        "[%s] Swap processing: %d total, %d decoded, %d fresh/dormant",
+        chain_id, len(swap_logs), decoded_count, interesting_count,
+    )
 
 
 # ---------------------------------------------------------------------------
