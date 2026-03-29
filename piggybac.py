@@ -9,6 +9,7 @@ the strongest signal.
 """
 
 import os
+import re
 import time
 import logging
 import threading
@@ -43,8 +44,14 @@ CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction thr
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
 POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
 TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
-MIN_LIQUIDITY_USD = 2_000             # skip tokens with < $2k liquidity (Pump.fun starts near zero)
+MIN_LIQUIDITY_USD = 2_000              # skip tokens with < $2k liquidity (Pump.fun starts near zero)
 MIN_SELLS_H1 = 1                       # skip tokens with 0 sells in last hour (honeypot filter)
+MIN_MCAP_USD = 5_000                   # skip tokens below $5K mcap (sub-$2K consistently flatlines)
+MIN_BUYS_H1 = 75                       # skip tokens with < 75 buys/h (dead market)
+HIGH_WALLET_THRESHOLD = 30             # warn if 30+ wallets all unknown funding
+NAME_HISTORY_TTL_HOURS = 12            # how long to remember alerted token names
+WALLET_HISTORY_TTL_HOURS = 12          # how long to remember cluster wallets
+CONFIRM_PING_DELAY_SECONDS = 180       # 3-minute post-alert price check
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -216,6 +223,18 @@ token_socials_cache: dict[str, dict] = {}
 # token_address -> {chain_id, network, alert_ts, price_usd, mcap_usd, token_name, token_symbol, explorer_url}
 pending_reviews: dict[str, dict] = {}
 
+# Improvement 2: Token name re-launch tracking
+# normalized_name -> [{"name": str, "contract": str, "chain": str, "timestamp": float}]
+recent_token_names: dict[str, list[dict]] = {}
+
+# Improvement 4: Cluster wallet history
+# wallet_address -> [{"token_name": str, "contract": str, "chain": str, "timestamp": float}]
+wallet_cluster_history: dict[str, list[dict]] = {}
+
+# Improvement 5: Raw wallet funder address cache (populated as side effect of funding source lookups)
+# wallet_address -> funder_address (str) or None
+wallet_funder_cache: dict[str, str | None] = {}
+
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
 
@@ -248,21 +267,159 @@ def fmt_mcap(v: float | None) -> str:
     return f"${v:,.0f}"
 
 
-def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count: int) -> tuple[int, str]:
+# ---------------------------------------------------------------------------
+# Improvement 2: Token name re-launch detection
+# ---------------------------------------------------------------------------
+
+def normalize_token_name(name: str) -> str:
+    """Strip to lowercase alphanumeric only for fuzzy name matching."""
+    return re.sub(r"[^a-z0-9]", "", name.lower().strip())
+
+
+def _purge_old_name_history() -> None:
+    cutoff = NOW_TS() - NAME_HISTORY_TTL_HOURS * 3600
+    for key in list(recent_token_names.keys()):
+        recent_token_names[key] = [e for e in recent_token_names[key] if e["timestamp"] > cutoff]
+        if not recent_token_names[key]:
+            del recent_token_names[key]
+
+
+def check_name_relaunch(token_name: str, token_address: str, chain: str) -> str | None:
+    """Return a warning line if this token name was alerted before, else None."""
+    _purge_old_name_history()
+    key = normalize_token_name(token_name)
+    if not key:
+        return None
+    prev = [e for e in recent_token_names.get(key, []) if e["contract"] != token_address]
+    if not prev:
+        return None
+    attempt = len(prev) + 1
+    last = prev[-1]
+    age_min = int((NOW_TS() - last["timestamp"]) / 60)
+    age_str = f"{age_min}min ago" if age_min < 120 else f"{age_min // 60}h ago"
+    suffix = " — may be the committed pump." if attempt >= 3 else ""
+    return f"🔄 Re-launch #{attempt} of <b>{token_name}</b> (prev: {age_str}){suffix}"
+
+
+def record_token_name(token_name: str, token_address: str, chain: str) -> None:
+    key = normalize_token_name(token_name)
+    if not key:
+        return
+    if key not in recent_token_names:
+        recent_token_names[key] = []
+    recent_token_names[key].append({"name": token_name, "contract": token_address, "chain": chain, "timestamp": NOW_TS()})
+
+
+# ---------------------------------------------------------------------------
+# Improvement 4: Cluster wallet memory + overlap detection
+# ---------------------------------------------------------------------------
+
+def _purge_old_wallet_history() -> None:
+    cutoff = NOW_TS() - WALLET_HISTORY_TTL_HOURS * 3600
+    for w in list(wallet_cluster_history.keys()):
+        wallet_cluster_history[w] = [e for e in wallet_cluster_history[w] if e["timestamp"] > cutoff]
+        if not wallet_cluster_history[w]:
+            del wallet_cluster_history[w]
+
+
+def check_wallet_overlap(wallets: list[str], token_address: str) -> str | None:
+    """Return overlap warning if wallets in this cluster appeared in a previous cluster."""
+    _purge_old_wallet_history()
+    now = NOW_TS()
+    overlap: dict[str, list[dict]] = {}
+    for w in wallets:
+        for entry in wallet_cluster_history.get(w, []):
+            if entry["contract"] == token_address:
+                continue
+            if now - entry["timestamp"] < 60:
+                continue
+            prev_ca = entry["contract"]
+            if prev_ca not in overlap:
+                overlap[prev_ca] = []
+            overlap[prev_ca].append(entry)
+
+    if not overlap:
+        return None
+
+    best_ca = max(overlap, key=lambda ca: overlap[ca][-1]["timestamp"])
+    entries = overlap[best_ca]
+    count = len(set(e.get("wallet", "") for e in entries))
+    last = entries[-1]
+    age_min = int((now - last["timestamp"]) / 60)
+    age_str = f"{age_min}min ago" if age_min < 120 else f"{age_min // 60}h ago"
+    name = last.get("token_name", best_ca[:10])
+    return f"🔗 {count} wallet{'s' if count > 1 else ''} also in <b>{name}</b> cluster ({age_str})"
+
+
+def record_cluster_wallets(token_name: str, token_address: str, chain: str, wallets: list[str]) -> None:
+    now = NOW_TS()
+    for w in wallets:
+        if w not in wallet_cluster_history:
+            wallet_cluster_history[w] = []
+        wallet_cluster_history[w].append({
+            "wallet": w, "token_name": token_name, "contract": token_address,
+            "chain": chain, "timestamp": now,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Improvement 5: Funder clustering (reuses existing API call data)
+# ---------------------------------------------------------------------------
+
+def analyze_funder_clustering(buys: list[dict]) -> str | None:
+    """
+    Group fresh wallets by their raw funder address. Returns a summary line or None.
+    """
+    funders: dict[str, list[str]] = {}
+    for b in buys:
+        if b.get("wallet_type") != "fresh":
+            continue
+        w = b["wallet"]
+        funder = wallet_funder_cache.get(w)
+        if funder is None:
+            continue
+        if funder not in funders:
+            funders[funder] = []
+        funders[funder].append(w)
+
+    if not funders:
+        return None
+
+    total_fresh = sum(1 for b in buys if b.get("wallet_type") == "fresh")
+    max_group = max(funders.values(), key=len)
+
+    if len(max_group) >= 3:
+        short = max_group[0][:6] + "..." + max_group[0][-4:]
+        return f"💰 {len(max_group)}/{total_fresh} wallets funded by same source ({short})"
+    if len(funders) >= 3:
+        return f"💰 {len(funders)} different funders — diverse funding ✅"
+    return None
+
+
+def score_cluster(
+    fresh_count: int,
+    dormant_count: int,
+    total: int,
+    speed_count: int,
+    all_funding_unknown: bool = False,
+) -> tuple[int, str]:
     """
     Returns (score, tier_emoji).
     Tier:
-      🔥    — basic signal (5+ wallets, mostly fresh)
+      🔥    — basic signal (7+ wallets, mostly fresh)
       🔥🔥  — strong signal (10+ wallets OR mixed fresh+dormant)
       🔥🔥🔥 — massive cook (20+ wallets OR heavy mix)
+
+    If all_funding_unknown=True AND total >= HIGH_WALLET_THRESHOLD, tier is
+    capped at 🔥 — large clusters with 100% unknown funding are likely fake.
     """
     score = total
 
     # Mixed fresh+dormant is the strongest signal
     if fresh_count > 0 and dormant_count > 0:
-        score += dormant_count * 3  # dormant wallets weighted heavily
+        score += dormant_count * 3
 
-    # Speed bonus — many wallets in first few minutes
+    # Speed bonus
     if speed_count >= 3:
         score += speed_count * 2
 
@@ -271,6 +428,10 @@ def score_cluster(fresh_count: int, dormant_count: int, total: int, speed_count:
     elif total >= 10 or (fresh_count > 0 and dormant_count > 0):
         tier = "🔥🔥"
     else:
+        tier = "🔥"
+
+    # Cap tier for suspicious large clusters (Improvement 3)
+    if all_funding_unknown and total >= HIGH_WALLET_THRESHOLD:
         tier = "🔥"
 
     return score, tier
@@ -529,6 +690,9 @@ def get_wallet_funding_source(chain_id: str, address: str) -> str | None:
     if not transfers:
         return None
     funding_sources = CHAINS[chain_id]["known_funding_sources"]
+    first_sender = (transfers[0].get("from") or "").lower()
+    if first_sender:
+        wallet_funder_cache[address] = first_sender  # capture raw funder (Improvement 5)
     for t in transfers:
         sender = (t.get("from") or "").lower()
         for known_addr, label in funding_sources.items():
@@ -667,6 +831,14 @@ def token_quality_fail_reason(token_address: str) -> str | None:
     if sells is not None and sells < MIN_SELLS_H1:
         return "no sells in last 1h (possible honeypot)"
 
+    mcap = token_mcap_cache.get(token_address)
+    if mcap is not None and mcap < MIN_MCAP_USD:
+        return f"mcap too low (${mcap:,.0f} < ${MIN_MCAP_USD:,})"
+
+    buys_h1 = token_buys_h1_cache.get(token_address)
+    if buys_h1 is not None and buys_h1 < MIN_BUYS_H1:
+        return f"low buy activity ({buys_h1} buys/h < {MIN_BUYS_H1})"
+
     return None
 
 
@@ -767,6 +939,77 @@ def _send_performance_review(token_address: str, review: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Improvement 6: 3-minute confirmation ping
+# ---------------------------------------------------------------------------
+
+
+def schedule_confirmation_ping(
+    token_address: str,
+    network: str,
+    token_name: str,
+    alert_price: float | None,
+    alert_mcap: float | None,
+    recipient_msg_ids: dict[str, int],
+) -> None:
+    """
+    Spawn a daemon thread that sleeps CONFIRM_PING_DELAY_SECONDS (3 min), then
+    refetches DexScreener and sends a brief price-check reply to the original alert.
+    """
+    def _ping() -> None:
+        time.sleep(CONFIRM_PING_DELAY_SECONDS)
+        try:
+            current_price: float | None = None
+            current_mcap: float | None = None
+            buys_5m: int | None = None
+            try:
+                r = requests.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+                    timeout=8,
+                )
+                r.raise_for_status()
+                pairs = r.json().get("pairs") or []
+                if pairs:
+                    best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+                    p = best.get("priceUsd")
+                    m = best.get("marketCap") or best.get("fdv")
+                    current_price = float(p) if p else None
+                    current_mcap = float(m) if m else None
+                    txns = best.get("txns") or {}
+                    buys_5m = int((txns.get("m5") or {}).get("buys") or 0)
+            except Exception as exc:
+                log.warning("[ping] DexScreener fetch failed for %s: %s", token_address[:10], exc)
+
+            if alert_price and current_price:
+                pct = (current_price - alert_price) / alert_price * 100
+                if pct >= 20:
+                    verdict = f"🚀 +{pct:.1f}% — confirmed move!"
+                elif pct >= 5:
+                    verdict = f"📈 +{pct:.1f}% — up"
+                elif pct >= -5:
+                    verdict = f"😐 {pct:+.1f}% — flat"
+                elif pct >= -20:
+                    verdict = f"📉 {pct:.1f}% — fading"
+                else:
+                    verdict = f"💀 {pct:.1f}% — dumping"
+            else:
+                verdict = "❓ Price N/A"
+
+            buys_str = f"  |  Buys/5min: {buys_5m}" if buys_5m is not None else ""
+            msg = (
+                f"⏱ <b>3min check</b> — {token_name}\n"
+                f"Price: {fmt_price(current_price)} (was {fmt_price(alert_price)})\n"
+                f"MCap: {fmt_mcap(current_mcap)}{buys_str}\n"
+                f"<b>{verdict}</b>"
+            )
+            send_telegram(msg, reply_to_message_ids=recipient_msg_ids)
+            log.info("[ping] 3min check sent for %s: %s", token_name, verdict)
+        except Exception as exc:
+            log.warning("[ping] Confirmation ping failed for %s: %s", token_address[:10], exc)
+
+    threading.Thread(target=_ping, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
@@ -776,8 +1019,14 @@ def _send_performance_review(token_address: str, review: dict) -> None:
 telegram_subscribers: set[str] = set()
 
 
-def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML", reply_markup: dict | None = None) -> None:
-    """Send a single Telegram message to one chat_id."""
+def _tg_send(
+    chat_id: str,
+    message: str,
+    parse_mode: str = "HTML",
+    reply_markup: dict | None = None,
+    reply_to_message_id: int | None = None,
+) -> int | None:
+    """Send a single Telegram message to one chat_id. Returns message_id or None."""
     import json as _json
     payload: dict = {
         "chat_id": chat_id,
@@ -787,6 +1036,8 @@ def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML", reply_markup:
     }
     if reply_markup:
         payload["reply_markup"] = _json.dumps(reply_markup)
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -794,22 +1045,33 @@ def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML", reply_markup:
             timeout=10,
         )
         r.raise_for_status()
+        return (r.json().get("result") or {}).get("message_id")
     except Exception as exc:
         log.error("Telegram send to %s failed: %s", chat_id, exc)
+        return None
 
 
-def send_telegram(message: str, reply_markup: dict | None = None) -> None:
-    """Broadcast an alert to all subscribers."""
+def send_telegram(
+    message: str,
+    reply_markup: dict | None = None,
+    reply_to_message_ids: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Broadcast an alert to all subscribers. Returns {chat_id: message_id}."""
     if not TELEGRAM_BOT_TOKEN:
         log.warning("Telegram not configured — skipping alert")
         log.info("ALERT:\n%s", message)
-        return
+        return {}
     recipients = list(telegram_subscribers)
     if not recipients:
         log.warning("No Telegram subscribers yet — skipping alert")
-        return
+        return {}
+    sent_ids: dict[str, int] = {}
     for chat_id in recipients:
-        _tg_send(chat_id, message, reply_markup=reply_markup)
+        reply_to = (reply_to_message_ids or {}).get(chat_id)
+        msg_id = _tg_send(chat_id, message, reply_markup=reply_markup, reply_to_message_id=reply_to)
+        if msg_id:
+            sent_ids[chat_id] = msg_id
+    return sent_ids
 
 
 def poll_telegram_commands() -> None:
@@ -918,6 +1180,39 @@ def _cex_diversity_note(buys: list[dict]) -> str:
     return ""
 
 
+def _gather_alert_signals(token_name: str, token_address: str, chain: str, buys: list[dict]) -> list[str]:
+    """Collect all extra signal lines: CEX diversity, fake cluster warning, re-launch, overlap, funder."""
+    signals = []
+    sources = [b.get("funding_source") for b in buys if b.get("wallet_type") == "fresh"]
+    known = [s for s in sources if s and s.lower() not in ("unknown", "none")]
+    all_unknown = not known and bool(sources)
+    unique_cexes = len(set(known))
+
+    if unique_cexes >= 3:
+        signals.append(f"✅ {unique_cexes} different CEXes funded these wallets")
+    elif unique_cexes >= 2:
+        signals.append(f"⚡ {unique_cexes} different CEXes")
+    elif all_unknown:
+        signals.append("⚠️ All funding sources unknown")
+        if len(buys) >= HIGH_WALLET_THRESHOLD:
+            signals.append(f"⚠️ {len(buys)} wallets all unknown — possible fake cluster")
+
+    name_note = check_name_relaunch(token_name, token_address, chain)
+    if name_note:
+        signals.append(name_note)
+
+    all_wallets = [b["wallet"] for b in buys]
+    overlap_note = check_wallet_overlap(all_wallets, token_address)
+    if overlap_note:
+        signals.append(overlap_note)
+
+    funder_note = analyze_funder_clustering(buys)
+    if funder_note:
+        signals.append(funder_note)
+
+    return signals
+
+
 def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
     chain = CHAINS[chain_id]
     info = get_token_info(chain_id, token_address)
@@ -929,13 +1224,14 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
-    speed_count = len(buys)
-    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), speed_count, speed_count)
+
+    sources = [b.get("funding_source") for b in fresh_buys]
+    all_unknown = not any(s and s.lower() not in ("unknown", "none") for s in sources)
+    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), len(buys), all_funding_unknown=all_unknown)
 
     age_str = _format_age(token_age_hours)
     ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # Market data
     liq = token_liquidity_cache.get(token_address)
     liq_str = f"${liq:,.0f}" if liq is not None else "?"
     sells = token_sells_h1_cache.get(token_address)
@@ -943,7 +1239,6 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
     mcap = token_mcap_cache.get(token_address)
     price = token_price_cache.get(token_address)
 
-    # Wallet lines — fresh first, then dormant
     wallet_lines = []
     for b in fresh_buys:
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
@@ -956,14 +1251,13 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
         inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
         wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
 
-    # Summary header
     summary_parts = []
     if fresh_buys:
         summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
     if dormant_buys:
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
 
-    cex_note = _cex_diversity_note(buys)
+    extra_signals = _gather_alert_signals(token_name, token_address, chain_id, buys)
 
     lines = [
         f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}",
@@ -974,8 +1268,9 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
-    if cex_note:
-        lines.append(cex_note)
+    for sig in extra_signals:
+        if sig:
+            lines.append(sig)
     lines.append("")
     lines.extend(wallet_lines)
 
@@ -1039,8 +1334,15 @@ def check_for_clusters(chain_id: str) -> None:
             explorer_url=f"{chain['explorer_url']}/token/{token_address}",
             socials=token_socials_cache.get(token_address),
         )
-        send_telegram(message, reply_markup=keyboard)
+        sent_ids = send_telegram(message, reply_markup=keyboard)
         info = get_token_info(chain_id, token_address)
+        record_token_name(info["name"], token_address, chain_id)
+        record_cluster_wallets(info["name"], token_address, chain_id, [b["wallet"] for b in unique_buys])
+        schedule_confirmation_ping(
+            token_address, chain["dexscreener_network"], info["name"],
+            token_price_cache.get(token_address), token_mcap_cache.get(token_address),
+            sent_ids,
+        )
         schedule_performance_review(
             token_address, chain_id, CHAINS[chain_id]["dexscreener_network"],
             info["name"], info["symbol"],
@@ -1274,21 +1576,27 @@ def get_solana_funding_source(address: str) -> str | None:
         return None
     # Check only the 2 oldest signatures (reversed list = oldest last)
     oldest_sigs = [s["signature"] for s in reversed(sigs)][:2]
+    first_sender_found = None
     for sig in oldest_sigs:
         result = helius_rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
         if not result:
             continue
-        meta = result.get("meta") or {}
         for instruction in (result.get("transaction", {}).get("message", {}).get("instructions") or []):
             parsed = instruction.get("parsed")
             if not isinstance(parsed, dict):
                 continue
             info = parsed.get("info") or {}
             sender = info.get("source") or info.get("authority") or ""
+            if sender and not first_sender_found:
+                first_sender_found = sender  # capture raw funder (Improvement 5)
             for known_addr, label in SOLANA_KNOWN_FUNDING_SOURCES.items():
                 if sender == known_addr:
+                    wallet_funder_cache[address] = sender
                     return label
         time.sleep(0.1)
+    # Store raw funder even if no known CEX matched
+    if first_sender_found:
+        wallet_funder_cache[address] = first_sender_found
     return None
 
 
@@ -1372,13 +1680,14 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
-    speed_count = len(buys)
-    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), speed_count, speed_count)
+
+    sources = [b.get("funding_source") for b in fresh_buys]
+    all_unknown = not any(s and s.lower() not in ("unknown", "none") for s in sources)
+    _, tier = score_cluster(len(fresh_buys), len(dormant_buys), len(buys), len(buys), all_funding_unknown=all_unknown)
 
     age_str = _format_age(token_age_hours)
     ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # Market data
     liq = token_liquidity_cache.get(token_address)
     liq_str = f"${liq:,.0f}" if liq is not None else "?"
     sells = token_sells_h1_cache.get(token_address)
@@ -1386,7 +1695,6 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
     mcap = token_mcap_cache.get(token_address)
     price = token_price_cache.get(token_address)
 
-    # Wallet lines — fresh first, then dormant
     wallet_lines = []
     for b in fresh_buys:
         short_w = b["wallet"][:6] + "..." + b["wallet"][-4:]
@@ -1399,14 +1707,13 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
         inactive_days = int((NOW_TS() - b["last_ts"]) / 86400)
         wallet_lines.append(f"  💤 <a href='{tx_url}'>{short_w}</a> (dormant {inactive_days}d)")
 
-    # Summary + CEX diversity
     summary_parts = []
     if fresh_buys:
         summary_parts.append(f"{len(fresh_buys)} fresh 🆕")
     if dormant_buys:
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
 
-    cex_note = _cex_diversity_note(buys)
+    extra_signals = _gather_alert_signals(token_name, token_address, "solana", buys)
 
     lines = [
         f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}",
@@ -1417,8 +1724,9 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
-    if cex_note:
-        lines.append(cex_note)
+    for sig in extra_signals:
+        if sig:
+            lines.append(sig)
     lines.append("")
     lines.extend(wallet_lines)
 
@@ -1473,8 +1781,15 @@ def check_solana_clusters() -> None:
             pump_fun_url=f"https://pump.fun/coin/{token_address}" if is_pump else None,
             socials=token_socials_cache.get(token_address),
         )
-        send_telegram(message, reply_markup=keyboard)
+        sent_ids = send_telegram(message, reply_markup=keyboard)
         info = get_solana_token_info(token_address)
+        record_token_name(info["name"], token_address, "solana")
+        record_cluster_wallets(info["name"], token_address, "solana", [b["wallet"] for b in unique_buys])
+        schedule_confirmation_ping(
+            token_address, "solana", info["name"],
+            token_price_cache.get(token_address), token_mcap_cache.get(token_address),
+            sent_ids,
+        )
         schedule_performance_review(
             token_address, "solana", "solana",
             info["name"], info["symbol"],
