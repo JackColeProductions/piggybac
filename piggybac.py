@@ -200,6 +200,16 @@ token_liquidity_cache: dict[str, float | None] = {}
 # token_address -> sell count in last 1h (None = unknown)
 token_sells_h1_cache: dict[str, int | None] = {}
 
+# token_address -> price in USD at time of first DexScreener lookup
+token_price_cache: dict[str, float | None] = {}
+
+# token_address -> market cap USD at time of first DexScreener lookup
+token_mcap_cache: dict[str, float | None] = {}
+
+# Tokens awaiting 24h performance review
+# token_address -> {chain_id, network, alert_ts, price_usd, mcap_usd, token_name, token_symbol, explorer_url}
+pending_reviews: dict[str, dict] = {}
+
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
 
@@ -564,6 +574,14 @@ def get_token_age_hours(token_address: str, dexscreener_network: str = "solana")
                 total_sells += int((txns.get("h1") or {}).get("sells") or 0)
             token_sells_h1_cache[token_address] = total_sells
 
+        # Cache price and market cap from highest-liquidity pair
+        if token_address not in token_price_cache:
+            best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+            price = best.get("priceUsd")
+            mcap = best.get("marketCap") or best.get("fdv")
+            token_price_cache[token_address] = float(price) if price else None
+            token_mcap_cache[token_address] = float(mcap) if mcap else None
+
         # Find the earliest pair creation timestamp (ms → s)
         earliest_ms = min(
             p["pairCreatedAt"] for p in pairs if p.get("pairCreatedAt")
@@ -600,6 +618,117 @@ def token_quality_fail_reason(token_address: str) -> str | None:
         return "no sells in last 1h (possible honeypot)"
 
     return None
+
+
+def schedule_performance_review(token_address: str, chain_id: str, network: str,
+                                 token_name: str, token_symbol: str, explorer_url: str) -> None:
+    """Record a token for a 24h performance review after an alert fires."""
+    if token_address in pending_reviews:
+        return  # already scheduled
+    pending_reviews[token_address] = {
+        "chain_id": chain_id,
+        "network": network,
+        "alert_ts": NOW_TS(),
+        "price_usd": token_price_cache.get(token_address),
+        "mcap_usd": token_mcap_cache.get(token_address),
+        "token_name": token_name,
+        "token_symbol": token_symbol,
+        "explorer_url": explorer_url,
+    }
+    log.info("[review] Scheduled 24h review for %s (%s)", token_name, token_address[:10])
+
+
+def run_performance_reviews() -> None:
+    """
+    Background thread: every 5 minutes checks if any alerted token has
+    reached its 24h mark and sends a performance review to all subscribers.
+    """
+    REVIEW_DELAY = 24 * 3600  # 24 hours
+    CHECK_INTERVAL = 5 * 60   # check every 5 minutes
+
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        now = NOW_TS()
+        due = [addr for addr, r in list(pending_reviews.items())
+               if now - r["alert_ts"] >= REVIEW_DELAY]
+
+        for token_address in due:
+            review = pending_reviews.pop(token_address, None)
+            if not review:
+                continue
+            try:
+                _send_performance_review(token_address, review)
+            except Exception as exc:
+                log.error("[review] Failed for %s: %s", token_address[:10], exc)
+
+
+def _send_performance_review(token_address: str, review: dict) -> None:
+    """Fetch current DexScreener data and send the 24h performance review."""
+    name = review["token_name"]
+    symbol = review["token_symbol"]
+    explorer_url = review["explorer_url"]
+    network = review["network"]
+    dexscreener_url = f"https://dexscreener.com/{network}/{token_address}"
+    short_addr = token_address[:6] + "..." + token_address[-4:]
+
+    entry_price = review["price_usd"]
+    entry_mcap = review["mcap_usd"]
+
+    # Fetch fresh DexScreener data
+    current_price = None
+    current_mcap = None
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=8,
+        )
+        r.raise_for_status()
+        pairs = r.json().get("pairs") or []
+        if pairs:
+            best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+            p = best.get("priceUsd")
+            m = best.get("marketCap") or best.get("fdv")
+            current_price = float(p) if p else None
+            current_mcap = float(m) if m else None
+    except Exception as exc:
+        log.warning("[review] DexScreener fetch failed for %s: %s", token_address[:10], exc)
+
+    def fmt_price(v):
+        if v is None:
+            return "N/A"
+        if v < 0.000001:
+            return f"${v:.2e}"
+        if v < 0.01:
+            return f"${v:.8f}"
+        return f"${v:,.4f}"
+
+    def fmt_mcap(v):
+        if v is None:
+            return "N/A"
+        if v >= 1_000_000:
+            return f"${v/1_000_000:.2f}M"
+        if v >= 1_000:
+            return f"${v/1_000:.1f}K"
+        return f"${v:,.0f}"
+
+    # Calculate change
+    if entry_price and current_price:
+        pct = (current_price - entry_price) / entry_price * 100
+        direction = "🚀" if pct >= 100 else ("📈" if pct > 0 else "📉")
+        pct_str = f"{pct:+.1f}% {direction}"
+    else:
+        pct_str = "N/A"
+
+    msg = (
+        f"📊 <b>24h Review</b> — {name} ({symbol})\n"
+        f"<b>Address:</b> <a href='{explorer_url}'>{short_addr}</a>\n\n"
+        f"<b>At alert:</b>  Price {fmt_price(entry_price)} | MCap {fmt_mcap(entry_mcap)}\n"
+        f"<b>Now:</b>       Price {fmt_price(current_price)} | MCap {fmt_mcap(current_mcap)}\n\n"
+        f"<b>Performance: {pct_str}</b>\n\n"
+        f"<a href='{dexscreener_url}'>DexScreener</a> | <a href='{explorer_url}'>Explorer</a>"
+    )
+    log.info("[review] Sending 24h review for %s: %s", name, pct_str)
+    send_telegram(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +945,12 @@ def check_for_clusters(chain_id: str) -> None:
         )
         message = build_alert(chain_id, token_address, unique_buys, token_age)
         send_telegram(message)
+        info = get_token_info(chain_id, token_address)
+        schedule_performance_review(
+            token_address, chain_id, CHAINS[chain_id]["dexscreener_network"],
+            info["name"], info["symbol"],
+            f"{CHAINS[chain_id]['explorer_url']}/token/{token_address}",
+        )
 
 
 def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
@@ -1231,6 +1366,12 @@ def check_solana_clusters() -> None:
         )
         message = build_solana_alert_with_age(token_address, unique_buys, token_age)
         send_telegram(message)
+        info = get_solana_token_info(token_address)
+        schedule_performance_review(
+            token_address, "solana", "solana",
+            info["name"], info["symbol"],
+            f"https://solscan.io/token/{token_address}",
+        )
 
 
 def process_helius_swaps(txs: list[dict], program_id: str) -> int:
@@ -1425,6 +1566,12 @@ def main() -> None:
         t = threading.Thread(target=poll_telegram_commands, daemon=True)
         t.start()
         threads.append(t)
+
+    # Start 24h performance review scheduler
+    t = threading.Thread(target=run_performance_reviews, daemon=True)
+    t.start()
+    threads.append(t)
+    log.info("[review] 24h performance review scheduler started")
 
     # Start EVM chain scanners (Base + Ethereum) — one thread per chain if key is set
     evm_started = 0
