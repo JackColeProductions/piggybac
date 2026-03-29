@@ -607,26 +607,89 @@ def token_quality_fail_reason(token_address: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def send_telegram(message: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — skipping alert")
-        log.info("ALERT:\n%s", message)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+# Set of chat IDs to broadcast alerts to.
+# Seeded from TELEGRAM_CHAT_ID env var; grows as users send /start.
+telegram_subscribers: set[str] = set()
+
+
+def _tg_send(chat_id: str, message: str, parse_mode: str = "HTML") -> None:
+    """Send a single Telegram message to one chat_id."""
     try:
         r = requests.post(
-            url,
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": message,
-                "parse_mode": "HTML",
+                "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
             },
             timeout=10,
         )
         r.raise_for_status()
     except Exception as exc:
-        log.error("Telegram send failed: %s", exc)
+        log.error("Telegram send to %s failed: %s", chat_id, exc)
+
+
+def send_telegram(message: str) -> None:
+    """Broadcast an alert to all subscribers."""
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("Telegram not configured — skipping alert")
+        log.info("ALERT:\n%s", message)
+        return
+    recipients = list(telegram_subscribers)
+    if not recipients:
+        log.warning("No Telegram subscribers yet — skipping alert")
+        return
+    for chat_id in recipients:
+        _tg_send(chat_id, message)
+
+
+def poll_telegram_commands() -> None:
+    """
+    Long-poll Telegram for incoming messages.
+    Handles /start  — subscribes the user and sends a welcome message.
+    Handles /stop   — unsubscribes the user.
+    Runs as a daemon thread alongside the scanner threads.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    offset = 0
+    log.info("[Telegram] Command listener started")
+
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=35,
+            )
+            r.raise_for_status()
+            for update in r.json().get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                chat_id = str((msg.get("chat") or {}).get("id") or "")
+                if not chat_id:
+                    continue
+
+                if text.startswith("/start"):
+                    telegram_subscribers.add(chat_id)
+                    log.info("[Telegram] New subscriber: %s (total: %d)", chat_id, len(telegram_subscribers))
+                    _tg_send(chat_id,
+                        "✅ <b>Subscribed to PiggyBac!</b>\n\n"
+                        "You'll get alerts when 7+ fresh wallets buy the same token "
+                        "within 10 minutes across Solana, Base, and Ethereum.\n\n"
+                        "Send /stop to unsubscribe.",
+                    )
+                elif text.startswith("/stop"):
+                    telegram_subscribers.discard(chat_id)
+                    log.info("[Telegram] Unsubscribed: %s", chat_id)
+                    _tg_send(chat_id, "❌ Unsubscribed from PiggyBac alerts.")
+
+        except Exception as exc:
+            log.warning("[Telegram] Polling error: %s", exc)
+            time.sleep(5)
 
 
 def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
@@ -1351,6 +1414,17 @@ def scan_chain(chain_id: str) -> None:
 
 def main() -> None:
     threads = []
+
+    # Seed subscriber list from env var so existing chat still receives alerts
+    if TELEGRAM_CHAT_ID:
+        telegram_subscribers.add(TELEGRAM_CHAT_ID)
+        log.info("[Telegram] Seeded subscriber from TELEGRAM_CHAT_ID (%s)", TELEGRAM_CHAT_ID)
+
+    # Start Telegram command listener (handles /start, /stop)
+    if TELEGRAM_BOT_TOKEN:
+        t = threading.Thread(target=poll_telegram_commands, daemon=True)
+        t.start()
+        threads.append(t)
 
     # Start EVM chain scanners (Base + Ethereum) — one thread per chain if key is set
     evm_started = 0
