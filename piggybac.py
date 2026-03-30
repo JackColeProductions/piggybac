@@ -39,6 +39,10 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip().strip('"\'')
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# Set ENABLE_EVM_CHAINS=true in Railway env vars to re-enable Base + Ethereum scanning.
+# Disabled by default until Alchemy quota resets — public RPCs rate-limit under this load.
+ENABLE_EVM_CHAINS: bool = os.getenv("ENABLE_EVM_CHAINS", "false").lower() == "true"
+
 FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 90  # last active 3+ months ago = dormant (ETH wallets rarely hit 180d)
 CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction threshold
@@ -2770,20 +2774,22 @@ def main() -> None:
     threads.append(t)
     log.info("[review] 24h performance review scheduler started")
 
-    # Start EVM chain scanners (Base + Ethereum) — Alchemy preferred, public RPC fallback
-    evm_started = 0
-    for chain_id in CHAINS:
-        chain_name = CHAINS[chain_id]["name"]
-        if ALCHEMY_KEYS[chain_id]:
-            log.info("[%s] Using Alchemy RPC", chain_name)
-        else:
-            log.info("[%s] No Alchemy key — using public RPC (%s) + Basescan/Etherscan API",
-                     chain_name, PUBLIC_RPC_URLS[chain_id])
-        t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
-        t.start()
-        threads.append(t)
-        evm_started += 1
-        time.sleep(2)  # stagger startup to avoid rate limit spike
+    # Start EVM chain scanners (Base + Ethereum) — disabled until Alchemy quota resets
+    # Re-enable by setting ENABLE_EVM_CHAINS=true in Railway environment variables
+    if ENABLE_EVM_CHAINS:
+        for chain_id in CHAINS:
+            chain_name = CHAINS[chain_id]["name"]
+            if ALCHEMY_KEYS[chain_id]:
+                log.info("[%s] Using Alchemy RPC", chain_name)
+            else:
+                log.info("[%s] No Alchemy key — using public RPC (%s) + Basescan/Etherscan API",
+                         chain_name, PUBLIC_RPC_URLS[chain_id])
+            t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
+            t.start()
+            threads.append(t)
+            time.sleep(2)  # stagger startup to avoid rate limit spike
+    else:
+        log.info("[EVM] Base + Ethereum scanners disabled (set ENABLE_EVM_CHAINS=true to enable)")
 
     # Start Solana scanner
     if HELIUS_API_KEY:
