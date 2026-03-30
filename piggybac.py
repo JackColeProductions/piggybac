@@ -193,7 +193,7 @@ alerted_clusters: set[str] = set()
 # chain_id -> token_address -> last alert timestamp (Unix)
 # Prevents re-alerting the same token within ALERT_COOLDOWN_SECONDS
 token_last_alerted: dict[str, dict[str, int]] = {chain: {} for chain in ALL_CHAIN_IDS}
-ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 minutes between alerts for same token
+ALERT_COOLDOWN_SECONDS = 6 * 3600  # 6h fallback cooldown (session restart safety net)
 
 # token_address -> age_hours (None = lookup failed / treat as unknown)
 token_age_cache: dict[str, float | None] = {}
@@ -1397,10 +1397,14 @@ def check_for_clusters(chain_id: str) -> None:
             log.info("[%s] Skipping token %s — %s", chain_id, token_address[:10], fail_reason)
             continue
 
-        # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
+        # Permanent session dedup — once alerted, never alert again for this token
+        if token_address in alerted_clusters:
+            continue
+        # Fallback cooldown for container restarts (token_last_alerted survives within session)
         last_alert_ts = token_last_alerted[chain_id].get(token_address, 0)
         if NOW_TS() - last_alert_ts < ALERT_COOLDOWN_SECONDS:
             continue
+        alerted_clusters.add(token_address)
         token_last_alerted[chain_id][token_address] = NOW_TS()
 
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
@@ -1848,10 +1852,14 @@ def check_solana_clusters() -> None:
             log.info("[solana] Skipping token %s — %s", token_address[:10], fail_reason)
             continue
 
-        # Per-token cooldown: don't re-alert same token within ALERT_COOLDOWN_SECONDS
+        # Permanent session dedup — once alerted, never alert again for this token
+        if token_address in alerted_clusters:
+            continue
+        # Fallback cooldown for container restarts
         last_alert_ts = token_last_alerted["solana"].get(token_address, 0)
         if NOW_TS() - last_alert_ts < ALERT_COOLDOWN_SECONDS:
             continue
+        alerted_clusters.add(token_address)
         token_last_alerted["solana"][token_address] = NOW_TS()
 
         fresh_count = sum(1 for b in unique_buys if b["wallet_type"] == "fresh")
