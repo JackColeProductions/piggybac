@@ -2107,8 +2107,9 @@ def helius_get(endpoint: str, params: dict | None = None, _retries: int = 3) -> 
         try:
             r = requests.get(url, params=p, timeout=15)
             if r.status_code == 429:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                log.debug("[solana] Helius 429 on %s — backing off %ds", endpoint, wait)
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                log.warning("[solana] Helius GET 429 on %s — backoff %ds (attempt %d/%d)",
+                            endpoint, wait, attempt + 1, _retries)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
@@ -2118,6 +2119,7 @@ def helius_get(endpoint: str, params: dict | None = None, _retries: int = 3) -> 
                 time.sleep(1)
             else:
                 log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
+    log.warning("[solana] Helius GET %s — all %d retries exhausted", endpoint, _retries)
     return None
 
 
@@ -2205,6 +2207,9 @@ def helius_get_recent_swaps(program_id: str, until_sig: str = "") -> list[dict]:
     data = helius_get(f"/addresses/{program_id}/transactions", params=params)
     if isinstance(data, list):
         return data
+    if data is not None:
+        log.warning("[solana] Unexpected response from Helius for %s: %s",
+                    program_id[:10], str(data)[:200])
     return []
 
 
@@ -2696,9 +2701,11 @@ def scan_solana() -> None:
                     solana_program_last_sig[program_id] = txs[0].get("signature", until_sig)
                     count = process_helius_swaps(txs, program_id)
                     total_new += count
-                    log.debug("[solana] %s: %d swaps, %d new wallets of interest", dex_name, len(txs), count)
+                    log.info("[solana] %s: %d swaps fetched, %d fresh/dormant wallets", dex_name, len(txs), count)
+                else:
+                    log.debug("[solana] %s: no new swaps", dex_name)
 
-                time.sleep(0.5)  # gentle rate-limit between programs
+                time.sleep(1.0)  # increased rate-limit buffer between programs
 
             log.info("[Solana] Poll complete — %d fresh/dormant swaps across all DEXes", total_new)
             prune_solana_old_buys()
