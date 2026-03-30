@@ -2121,20 +2121,29 @@ def helius_get(endpoint: str, params: dict | None = None, _retries: int = 3) -> 
     return None
 
 
-def helius_rpc(method: str, params: list) -> object:
-    """JSON-RPC call via Helius RPC endpoint."""
-    try:
-        r = requests.post(
-            HELIUS_RPC_URL,
-            params={"api-key": HELIUS_API_KEY},
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json().get("result")
-    except Exception as exc:
-        log.warning("[solana] Helius RPC %s failed: %s", method, exc)
-        return None
+def helius_rpc(method: str, params: list, _retries: int = 3) -> object:
+    """JSON-RPC call via Helius RPC endpoint with 429 backoff."""
+    for attempt in range(_retries):
+        try:
+            r = requests.post(
+                HELIUS_RPC_URL,
+                params={"api-key": HELIUS_API_KEY},
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=10,
+            )
+            if r.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                log.debug("[solana] Helius RPC 429 on %s — backoff %ds", method, wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json().get("result")
+        except Exception as exc:
+            if attempt < _retries - 1:
+                time.sleep(1)
+            else:
+                log.warning("[solana] Helius RPC %s failed: %s", method, exc)
+    return None
 
 
 PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -2662,19 +2671,12 @@ def scan_solana() -> None:
     key_preview = (HELIUS_API_KEY[:8] + "..." + HELIUS_API_KEY[-4:]) if len(HELIUS_API_KEY) > 12 else f"(len={len(HELIUS_API_KEY)})"
     log.info("[Solana] Starting up via Helius... key: %s", key_preview)
 
-    # Connectivity check — retry up to 4 times (startup 429s are transient)
-    connected = False
-    for attempt in range(4):
-        test = helius_rpc("getSlot", [])
-        if test is not None:
-            log.info("[Solana] Helius connected (slot %s). Monitoring %d DEX programs.", test, len(SOLANA_DEX_PROGRAMS))
-            connected = True
-            break
-        wait = (attempt + 1) * 10
-        log.warning("[Solana] Connectivity check attempt %d/4 failed — retrying in %ds", attempt + 1, wait)
-        time.sleep(wait)
-    if not connected:
-        log.warning("[Solana] Could not confirm Helius connection — proceeding anyway (scanner will self-recover)")
+    # Quick connectivity check — single attempt, proceed regardless
+    test = helius_rpc("getSlot", [])
+    if test is not None:
+        log.info("[Solana] Helius connected (slot %s). Monitoring %d DEX programs.", test, len(SOLANA_DEX_PROGRAMS))
+    else:
+        log.warning("[Solana] Helius connectivity check failed — starting anyway (will self-recover)")
 
     while True:
         total_new = 0
