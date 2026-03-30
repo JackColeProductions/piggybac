@@ -47,7 +47,8 @@ FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 90  # last active 3+ months ago = dormant (ETH wallets rarely hit 180d)
 CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction threshold
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
-POLL_INTERVAL_SECONDS = 20             # scan every 20s to stay near real-time
+POLL_INTERVAL_SECONDS = 45             # scan every 45s (reduced to respect Helius rate limits)
+HELIUS_CIRCUIT_BREAK_SECONDS = 300    # skip a program for 5min after it 429s
 TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
 MIN_LIQUIDITY_USD = 2_000              # skip tokens with < $2k liquidity (Pump.fun starts near zero)
 MIN_SELLS_H1 = 1                       # skip tokens with 0 sells in last hour (honeypot filter)
@@ -280,6 +281,9 @@ last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
 
 # Solana: last seen tx signature per DEX program to avoid re-processing
 solana_program_last_sig: dict[str, str] = {}
+
+# Solana: circuit breaker — skip programs that 429'd until this timestamp
+helius_backoff_until: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -2097,30 +2101,28 @@ def process_swap_logs(chain_id: str, swap_logs: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def helius_get(endpoint: str, params: dict | None = None, _retries: int = 3) -> list | dict | None:
-    """GET request to Helius Enhanced Transactions API with 429 backoff."""
+def helius_get(endpoint: str, params: dict | None = None) -> list | dict | None:
+    """
+    GET request to Helius Enhanced Transactions API.
+    Single attempt — no inline retry. Callers use circuit breaker to skip
+    backed-off programs rather than blocking the poll cycle with long waits.
+    Returns None on any failure (429, network error, etc.).
+    """
     url = f"{HELIUS_API_URL}{endpoint}"
     p = {"api-key": HELIUS_API_KEY}
     if params:
         p.update(params)
-    for attempt in range(_retries):
-        try:
-            r = requests.get(url, params=p, timeout=15)
-            if r.status_code == 429:
-                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
-                log.warning("[solana] Helius GET 429 on %s — backoff %ds (attempt %d/%d)",
-                            endpoint, wait, attempt + 1, _retries)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as exc:
-            if attempt < _retries - 1:
-                time.sleep(1)
-            else:
-                log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
-    log.warning("[solana] Helius GET %s — all %d retries exhausted", endpoint, _retries)
-    return None
+    try:
+        r = requests.get(url, params=p, timeout=15)
+        if r.status_code == 429:
+            log.warning("[solana] Helius GET 429 on %s — circuit breaking for %ds",
+                        endpoint, HELIUS_CIRCUIT_BREAK_SECONDS)
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log.warning("[solana] Helius GET %s failed: %s", endpoint, exc)
+        return None
 
 
 def helius_rpc(method: str, params: list, _retries: int = 3) -> object:
@@ -2167,8 +2169,14 @@ def helius_poll_pumpfun_launches() -> int:
     if pumpfun_last_mint_sig:
         params["until"] = pumpfun_last_mint_sig
 
+    now = NOW_TS()
+    if now < helius_backoff_until.get(PUMPFUN_PROGRAM, 0):
+        return 0
     data = helius_get(f"/addresses/{PUMPFUN_PROGRAM}/transactions", params=params)
-    txs = data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        helius_backoff_until[PUMPFUN_PROGRAM] = now + HELIUS_CIRCUIT_BREAK_SECONDS
+        return 0
+    txs = data
 
     new_count = 0
     for tx in txs:
@@ -2198,15 +2206,29 @@ def helius_get_recent_swaps(program_id: str, until_sig: str = "") -> list[dict]:
     """
     Get recent SWAP transactions for a Solana DEX program via Helius
     Enhanced Transactions API. Returns newest-first list.
-    `until_sig` stops fetching at (exclusive) this signature — used to
-    retrieve only transactions newer than the last poll.
+    Uses a circuit breaker: if the program 429'd recently, skip it entirely
+    rather than blocking the poll cycle with retry waits.
     """
+    now = NOW_TS()
+    backoff_until = helius_backoff_until.get(program_id, 0)
+    if now < backoff_until:
+        remaining = int(backoff_until - now)
+        log.debug("[solana] %s in backoff — skipping for %ds more",
+                  SOLANA_DEX_PROGRAMS.get(program_id, program_id[:10]), remaining)
+        return []
+
     params: dict = {"type": "SWAP", "limit": 100}
     if until_sig:
         params["until"] = until_sig
     data = helius_get(f"/addresses/{program_id}/transactions", params=params)
+
     if isinstance(data, list):
+        # Successful — clear any backoff
+        helius_backoff_until.pop(program_id, None)
         return data
+
+    # Failed (None = 429 or error) — set circuit breaker
+    helius_backoff_until[program_id] = now + HELIUS_CIRCUIT_BREAK_SECONDS
     if data is not None:
         log.warning("[solana] Unexpected response from Helius for %s: %s",
                     program_id[:10], str(data)[:200])
