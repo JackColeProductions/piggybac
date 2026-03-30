@@ -47,8 +47,8 @@ FRESH_WALLET_MAX_AGE_HOURS = 24        # wallet created <24h ago = fresh
 DORMANT_WALLET_MIN_INACTIVE_DAYS = 90  # last active 3+ months ago = dormant (ETH wallets rarely hit 180d)
 CLUSTER_MIN_WALLETS = 7                # raised from 5 — higher conviction threshold
 CLUSTER_TIME_WINDOW_MINUTES = 10       # ALL those wallets must buy within this window
-POLL_INTERVAL_SECONDS = 45             # scan every 45s (reduced to respect Helius rate limits)
-HELIUS_CIRCUIT_BREAK_SECONDS = 300    # skip a program for 5min after it 429s
+POLL_INTERVAL_SECONDS = 60             # scan every 60s — 3 programs × 1 req = 3 req/min
+HELIUS_CIRCUIT_BREAK_SECONDS = 600    # skip a program for 10min after it 429s
 TOKEN_MAX_AGE_HOURS = 6                # skip tokens launched more than 6h ago
 MIN_LIQUIDITY_USD = 2_000              # skip tokens with < $2k liquidity (Pump.fun starts near zero)
 MIN_SELLS_H1 = 1                       # skip tokens with 0 sells in last hour (honeypot filter)
@@ -95,13 +95,12 @@ HELIUS_API_URL = "https://api.helius.xyz/v0"
 HELIUS_RPC_URL = "https://mainnet.helius-rpc.com"  # api-key appended at call time
 
 # Known Solana DEX program IDs
+# Trimmed to 3 highest-signal programs to stay within Helius free tier limits.
+# Pump.fun = new token launches; Raydium AMM = most new token liquidity;
+# Jupiter v6 = aggregator that catches buys on any DEX.
 SOLANA_DEX_PROGRAMS = {
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM",
-    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc":  "Orca Whirlpool",
-    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP": "Orca Token Swap",
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4":  "Jupiter v6",
-    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB":  "Jupiter v4",
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":  "Pump.fun",
 }
 
