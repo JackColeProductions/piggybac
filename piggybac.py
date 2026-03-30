@@ -480,8 +480,12 @@ def score_cluster(
 NOW_TS = lambda: int(time.time())
 
 
+# Methods that are Alchemy-specific and can't be called on public RPCs
+_ALCHEMY_SPECIFIC = frozenset({"alchemy_getAssetTransfers", "alchemy_getTokenMetadata"})
+
+
 def alchemy_rpc(chain_id: str, method: str, params: list) -> object:
-    """JSON-RPC call — uses Alchemy if key set, otherwise public RPC fallback."""
+    """JSON-RPC call — Alchemy first, automatic public RPC fallback on 429."""
     url = alchemy_url(chain_id) if ALCHEMY_KEYS[chain_id] else PUBLIC_RPC_URLS[chain_id]
     try:
         r = requests.post(
@@ -489,6 +493,14 @@ def alchemy_rpc(chain_id: str, method: str, params: list) -> object:
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=10,
         )
+        # On Alchemy quota exceeded (429), fall back to public RPC for standard methods
+        if r.status_code == 429 and ALCHEMY_KEYS[chain_id] and method not in _ALCHEMY_SPECIFIC:
+            log.debug("[%s] Alchemy quota exceeded for %s — retrying via public RPC", chain_id, method)
+            r = requests.post(
+                PUBLIC_RPC_URLS[chain_id],
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=10,
+            )
         if not r.ok:
             log.warning("[%s] EVM RPC %s HTTP %d: %s", chain_id, method, r.status_code, r.text[:300])
             return None
@@ -708,7 +720,7 @@ def _alchemy_asset_transfers(chain_id: str, direction: str, address: str,
         }])
         if result and "transfers" in result:
             return result["transfers"]
-        return []
+        # Alchemy returned nothing (quota exceeded) — fall through to explorer API
     return _explorer_tokentx(chain_id, direction, address, order, max_count)
 
 
@@ -823,13 +835,15 @@ def get_token_info(chain_id: str, token_address: str) -> dict:
     name: str | None = None
     symbol: str | None = None
 
+    # Try Alchemy first if key is set
     if ALCHEMY_KEYS[chain_id]:
         result = alchemy_rpc(chain_id, "alchemy_getTokenMetadata", [token_address])
         if result:
             name = result.get("name") or None
             symbol = result.get("symbol") or None
-    else:
-        # Try Basescan/Etherscan tokeninfo first
+
+    # Fall through to Basescan/Etherscan if Alchemy unavailable or returned nothing
+    if not name or not symbol:
         try:
             params: dict = {
                 "module": "token", "action": "tokeninfo",
@@ -842,8 +856,8 @@ def get_token_info(chain_id: str, token_address: str) -> dict:
             data = r.json()
             if data.get("status") == "1" and data.get("result"):
                 item = data["result"][0] if isinstance(data["result"], list) else data["result"]
-                name = item.get("tokenName") or item.get("name") or None
-                symbol = item.get("symbol") or None
+                name = name or item.get("tokenName") or item.get("name") or None
+                symbol = symbol or item.get("symbol") or None
         except Exception as exc:
             log.debug("[%s] Explorer tokeninfo failed for %s: %s", chain_id, token_address[:10], exc)
 
@@ -2644,12 +2658,19 @@ def scan_solana() -> None:
     key_preview = (HELIUS_API_KEY[:8] + "..." + HELIUS_API_KEY[-4:]) if len(HELIUS_API_KEY) > 12 else f"(len={len(HELIUS_API_KEY)})"
     log.info("[Solana] Starting up via Helius... key: %s", key_preview)
 
-    # Quick auth check
-    test = helius_rpc("getSlot", [])
-    if test is None:
-        log.error("[Solana] Helius auth/connectivity check failed — check HELIUS_API_KEY")
-        return
-    log.info("[Solana] Helius connected (slot %s). Monitoring %d DEX programs.", test, len(SOLANA_DEX_PROGRAMS))
+    # Connectivity check — retry up to 4 times (startup 429s are transient)
+    connected = False
+    for attempt in range(4):
+        test = helius_rpc("getSlot", [])
+        if test is not None:
+            log.info("[Solana] Helius connected (slot %s). Monitoring %d DEX programs.", test, len(SOLANA_DEX_PROGRAMS))
+            connected = True
+            break
+        wait = (attempt + 1) * 10
+        log.warning("[Solana] Connectivity check attempt %d/4 failed — retrying in %ds", attempt + 1, wait)
+        time.sleep(wait)
+    if not connected:
+        log.warning("[Solana] Could not confirm Helius connection — proceeding anyway (scanner will self-recover)")
 
     while True:
         total_new = 0
