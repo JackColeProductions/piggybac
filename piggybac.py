@@ -13,6 +13,7 @@ import re
 import time
 import logging
 import threading
+import concurrent.futures
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -52,6 +53,15 @@ HIGH_WALLET_THRESHOLD = 30             # warn if 30+ wallets all unknown funding
 NAME_HISTORY_TTL_HOURS = 12            # how long to remember alerted token names
 WALLET_HISTORY_TTL_HOURS = 12          # how long to remember cluster wallets
 CONFIRM_PING_DELAY_SECONDS = 180       # 3-minute post-alert price check
+
+# Wave 2: Wallet intelligence
+DEPLOYER_LOW_BALANCE_SOL = 2.0         # warn if deployer has < 2 SOL
+DEPLOYER_HIGH_HOLDINGS_PCT = 20.0      # warn if deployer holds > 20% of supply
+MAX_WALLETS_TO_PROFILE = 3             # max dormant wallets to PnL-profile per alert
+MAX_TOKENS_PER_WALLET = 5              # max historical tokens to score per wallet
+ENRICHMENT_TIMEOUT_SECONDS = 12        # hard timeout for entire enrichment pipeline
+MIN_CONVICTION_TO_ALERT = 20           # suppress alerts with conviction score below this
+WALLET_PROFILE_CACHE_TTL = 86400       # 24h — wallet history doesn't change fast
 
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -237,6 +247,12 @@ wallet_cluster_history: dict[str, list[dict]] = {}
 # Improvement 5: Raw wallet funder address cache (populated as side effect of funding source lookups)
 # wallet_address -> funder_address (str) or None
 wallet_funder_cache: dict[str, str | None] = {}
+
+# Wave 2 caches
+# token_address -> deployer wallet address (permanent — never changes)
+token_deployer_cache: dict[str, str | None] = {}
+# wallet_address -> (profile_dict, timestamp) — 24h TTL
+wallet_profile_cache: dict[str, tuple[dict, float]] = {}
 
 # chain_id -> last block processed (EVM chains only)
 last_block_checked: dict[str, int] = {chain: 0 for chain in CHAINS}
@@ -1291,14 +1307,21 @@ def _gather_alert_signals(token_name: str, token_address: str, chain: str, buys:
     return signals
 
 
-def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
+def build_alert(
+    chain_id: str,
+    token_address: str,
+    buys: list[dict],
+    token_age_hours: float | None = None,
+    enrichment: dict | None = None,
+    conviction_level: str | None = None,
+    conviction_score: int | None = None,
+    conviction_reasons: list[str] | None = None,
+) -> str:
     chain = CHAINS[chain_id]
     info = get_token_info(chain_id, token_address)
     token_name = info["name"]
     token_symbol = info["symbol"]
-    explorer_url = f"{chain['explorer_url']}/token/{token_address}"
     top_holders_str = _fmt_top_holders(token_top_holders_cache.get(token_address))
-    dexscreener_url = f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}"
     chain_label = chain["name"]
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
@@ -1337,26 +1360,429 @@ def build_alert(chain_id: str, token_address: str, buys: list[dict], token_age_h
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
 
     extra_signals = _gather_alert_signals(token_name, token_address, chain_id, buys)
+    if enrichment and enrichment.get("dev_funded"):
+        n = len(enrichment["dev_funded"])
+        pct = n / len(buys) * 100
+        extra_signals.insert(0, f"🚨 DEV FUNDED: {n}/{len(buys)} wallets funded by deployer ({pct:.0f}%)")
 
     liq_line = f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}"
     if top_holders_str:
         liq_line += f"  |  {top_holders_str}"
-    lines = [
+
+    lines = []
+    if conviction_level and conviction_score is not None:
+        lines.append(_fmt_conviction_block(conviction_level, conviction_score, conviction_reasons or []))
+        lines.append("")
+
+    lines += [
         f"{tier} <b>PiggyBac Alert</b> [{chain_label}] — {ts}",
         "",
         f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
         f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
         liq_line,
+    ]
+
+    # Deployer info
+    if enrichment:
+        deployer_line = _fmt_deployer_line(enrichment.get("deployer_info"))
+        if deployer_line:
+            lines.append(deployer_line)
+
+    lines += [
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
     for sig in extra_signals:
         if sig:
             lines.append(sig)
+
+    # Dormant wallet PnL profiles
+    if enrichment and enrichment.get("dormant_profiles"):
+        lines.append("")
+        lines.append("🏆 <b>Dormant wallet profiles:</b>")
+        for p in enrichment["dormant_profiles"]:
+            short_w = p["wallet"][:6] + "..." + p["wallet"][-4:]
+            label = SCORE_EMOJI.get(p.get("score", "unknown"), "❓")
+            analyzed = p.get("tokens_analyzed", 0)
+            winners = p.get("winners", 0)
+            detail = f"{winners}/{analyzed} winners" if analyzed > 0 else "no history"
+            lines.append(f"  😴 {short_w} — {label}: {detail}")
+
     lines.append("")
     lines.extend(wallet_lines)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: Wallet intelligence — deployer info, wallet PnL, conviction scoring
+# ---------------------------------------------------------------------------
+
+def get_solana_deployer(token_address: str) -> str | None:
+    """Return the wallet that created this Solana token (oldest signer). Cached permanently."""
+    if token_address in token_deployer_cache:
+        return token_deployer_cache[token_address]
+    try:
+        sigs = helius_rpc("getSignaturesForAddress", [token_address, {"limit": 1000}])
+        if not sigs or not isinstance(sigs, list):
+            token_deployer_cache[token_address] = None
+            return None
+        oldest_sig = sigs[-1]["signature"]
+        tx = helius_rpc("getTransaction", [oldest_sig, {
+            "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
+        }])
+        if not tx:
+            token_deployer_cache[token_address] = None
+            return None
+        keys = (tx.get("transaction", {}).get("message", {}).get("accountKeys") or [])
+        deployer = keys[0].get("pubkey") if keys else None
+        token_deployer_cache[token_address] = deployer
+        return deployer
+    except Exception as exc:
+        log.debug("[solana] Deployer lookup failed for %s: %s", token_address[:10], exc)
+        token_deployer_cache[token_address] = None
+        return None
+
+
+def get_deployer_info(token_address: str, chain_id: str) -> dict | None:
+    """
+    Get deployer wallet balance and token holdings %.
+    Solana only for now — EVM contract creator requires extra tracing.
+    Returns dict with keys: address, balance, holdings_pct.
+    """
+    if chain_id != "solana":
+        return None
+
+    deployer = get_solana_deployer(token_address)
+    if not deployer:
+        return None
+
+    result: dict = {"address": deployer, "balance": None, "holdings_pct": None}
+    try:
+        # Native SOL balance
+        bal = helius_rpc("getBalance", [deployer])
+        if bal is not None:
+            result["balance"] = float(bal) / 1e9
+
+        # Deployer's token holdings
+        supply_res = helius_rpc("getTokenSupply", [token_address])
+        total_supply = float((supply_res.get("value") or {}).get("uiAmount") or 0) if supply_res else 0
+        if total_supply > 0:
+            accounts = helius_rpc("getTokenAccountsByOwner", [
+                deployer, {"mint": token_address}, {"encoding": "jsonParsed"}
+            ])
+            if accounts:
+                holder_total = 0.0
+                for acct in (accounts.get("value") or []):
+                    amt = float(
+                        (acct.get("account", {}).get("data", {})
+                         .get("parsed", {}).get("info", {})
+                         .get("tokenAmount") or {}).get("uiAmount") or 0
+                    )
+                    holder_total += amt
+                if holder_total > 0:
+                    result["holdings_pct"] = (holder_total / total_supply) * 100
+    except Exception as exc:
+        log.debug("[solana] Deployer info failed for %s: %s", token_address[:10], exc)
+
+    return result
+
+
+def _fmt_deployer_line(info: dict | None) -> str:
+    """Format the deployer line for the alert."""
+    if not info or info.get("balance") is None:
+        return ""
+    bal = info["balance"]
+    holdings = info.get("holdings_pct")
+
+    bal_str = f"{bal:.2f} SOL"
+    bal_flag = " ⚠️" if bal < DEPLOYER_LOW_BALANCE_SOL else ""
+
+    if holdings is not None:
+        holdings_flag = " ⚠️" if holdings > DEPLOYER_HIGH_HOLDINGS_PCT else ""
+        return f"👤 Deployer: {bal_str}{bal_flag} | holds {holdings:.1f}%{holdings_flag} of supply"
+    return f"👤 Deployer: {bal_str}{bal_flag}"
+
+
+def get_wallet_bought_tokens_solana(wallet_address: str) -> list[str]:
+    """Get last MAX_TOKENS_PER_WALLET unique token mints bought by this Solana wallet."""
+    data = helius_get(
+        f"/addresses/{wallet_address}/transactions",
+        {"type": "SWAP", "limit": 50},
+    )
+    if not data or not isinstance(data, list):
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for tx in data:
+        for transfer in tx.get("tokenTransfers", []):
+            mint = transfer.get("mint", "")
+            if (transfer.get("toUserAccount") == wallet_address
+                    and mint and mint != WSOL_MINT and mint not in seen):
+                seen.add(mint)
+                tokens.append(mint)
+                if len(tokens) >= MAX_TOKENS_PER_WALLET:
+                    return tokens
+    return tokens
+
+
+def _score_token_performance(token_address: str) -> str:
+    """Classify a token as big_winner / winner / neutral / dead via DexScreener."""
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=5,
+        )
+        r.raise_for_status()
+        pairs = r.json().get("pairs") or []
+        if not pairs:
+            return "dead"
+        best_mcap = max(
+            (float(p.get("marketCap") or p.get("fdv") or 0) for p in pairs), default=0
+        )
+        best_liq = max(
+            (float((p.get("liquidity") or {}).get("usd") or 0) for p in pairs), default=0
+        )
+        if best_liq < 100:
+            return "dead"
+        if best_mcap >= 500_000:
+            return "big_winner"
+        if best_mcap >= 100_000:
+            return "winner"
+        return "neutral"
+    except Exception:
+        return "unknown"
+
+
+def profile_wallet(wallet_address: str, chain_id: str) -> dict:
+    """
+    Score a wallet based on its token trading history.
+    Cached for WALLET_PROFILE_CACHE_TTL seconds (24h).
+    """
+    now = NOW_TS()
+    cached = wallet_profile_cache.get(wallet_address)
+    if cached and now - cached[1] < WALLET_PROFILE_CACHE_TTL:
+        return cached[0]
+
+    if chain_id == "solana":
+        tokens = get_wallet_bought_tokens_solana(wallet_address)
+    else:
+        # EVM: use Alchemy asset transfers as a proxy for token buys
+        transfers = _alchemy_asset_transfers(chain_id, "toAddress", wallet_address, "desc", 20)
+        seen: set[str] = set()
+        tokens = []
+        for t in transfers:
+            addr = (t.get("rawContract") or {}).get("address", "")
+            if addr and addr not in seen:
+                seen.add(addr)
+                tokens.append(addr)
+                if len(tokens) >= MAX_TOKENS_PER_WALLET:
+                    break
+
+    if not tokens:
+        profile = {"tokens_analyzed": 0, "winners": 0, "big_winners": 0,
+                   "dead": 0, "score": "unknown"}
+        wallet_profile_cache[wallet_address] = (profile, now)
+        return profile
+
+    scores = [_score_token_performance(t) for t in tokens]
+    winners = scores.count("winner") + scores.count("big_winners")
+    big_winners = scores.count("big_winner")
+    dead = scores.count("dead")
+    total = len([s for s in scores if s != "unknown"])
+
+    win_rate = winners / total if total > 0 else 0
+    rug_rate = dead / total if total > 0 else 0
+
+    if big_winners >= 2 or (win_rate >= 0.5 and winners >= 2):
+        score = "alpha"
+    elif win_rate >= 0.3 or winners >= 1:
+        score = "profitable"
+    elif rug_rate >= 0.7:
+        score = "rug_buyer"
+    else:
+        score = "neutral"
+
+    profile = {
+        "tokens_analyzed": total,
+        "winners": winners,
+        "big_winners": big_winners,
+        "dead": dead,
+        "score": score,
+    }
+    wallet_profile_cache[wallet_address] = (profile, now)
+    return profile
+
+
+SCORE_EMOJI = {
+    "alpha":     "🏆 ALPHA",
+    "profitable":"📈 Profitable",
+    "neutral":   "😐 Neutral",
+    "rug_buyer": "💀 Rug buyer ⚠️",
+    "unknown":   "❓ Unknown",
+}
+
+
+def check_dev_funded_wallets(cluster_wallets: list[str], deployer_address: str) -> list[str]:
+    """Return cluster wallets funded by the deployer (1-hop via wallet_funder_cache)."""
+    if not deployer_address:
+        return []
+    deployer_lower = deployer_address.lower()
+    return [w for w in cluster_wallets
+            if (wallet_funder_cache.get(w) or "").lower() == deployer_lower]
+
+
+def calculate_conviction(
+    wallet_count: int,
+    dormant_profiles: list[dict],
+    all_funding_unknown: bool,
+    funding_diversity: int,
+    is_relaunch: bool,
+    relaunch_attempt: int,
+    wallet_overlap_count: int,
+    deployer_info: dict | None,
+    dev_funded_count: int,
+    buys_h1: int | None,
+    top_holders_pct: float | None,
+) -> tuple[str, int, list[str]]:
+    """
+    Calculate conviction score (0-100) and level (LOW/MEDIUM/HIGH/VERY HIGH).
+    Returns (level, score, reasons).
+    """
+    score = 50
+    reasons: list[str] = []
+
+    # Dormant wallet PnL history
+    alpha_n = sum(1 for p in dormant_profiles if p.get("score") == "alpha")
+    profit_n = sum(1 for p in dormant_profiles if p.get("score") == "profitable")
+    rug_n = sum(1 for p in dormant_profiles if p.get("score") == "rug_buyer")
+
+    if alpha_n >= 2:
+        score += 25; reasons.append(f"+25: {alpha_n} alpha-history dormant wallets")
+    elif alpha_n == 1:
+        score += 15; reasons.append("+15: dormant wallet with alpha history")
+    if profit_n >= 2:
+        score += 12; reasons.append(f"+12: {profit_n} profitable dormant wallets")
+    elif profit_n == 1:
+        score += 6;  reasons.append("+6: dormant wallet with profitable history")
+    if rug_n >= 2:
+        score -= 20; reasons.append(f"-20: {rug_n} dormant wallets with rug history")
+
+    # Funding diversity
+    if funding_diversity >= 3:
+        score += 10; reasons.append(f"+10: {funding_diversity} different funding sources")
+
+    # Re-launch signals
+    if is_relaunch and relaunch_attempt >= 3:
+        score += 10; reasons.append(f"+10: attempt #{relaunch_attempt} — team committing")
+    if wallet_overlap_count >= 2 and is_relaunch:
+        score += 10; reasons.append("+10: wallet overlap + re-launch")
+
+    # Deployer signals
+    if deployer_info:
+        bal = deployer_info.get("balance")
+        holdings = deployer_info.get("holdings_pct")
+        if bal is not None:
+            if bal >= 10:
+                score += 5;  reasons.append(f"+5: deployer has {bal:.1f} SOL")
+            elif bal < DEPLOYER_LOW_BALANCE_SOL:
+                score -= 10; reasons.append(f"-10: deployer low balance ({bal:.2f} SOL)")
+        if holdings is not None and holdings > DEPLOYER_HIGH_HOLDINGS_PCT:
+            score -= 10; reasons.append(f"-10: deployer holds {holdings:.1f}% of supply")
+
+    # Dev-funded wallets
+    dev_pct = dev_funded_count / wallet_count if wallet_count > 0 else 0
+    if dev_pct >= 0.5:
+        score -= 35; reasons.append(f"-35: {dev_funded_count}/{wallet_count} wallets funded by deployer")
+    elif dev_pct >= 0.2:
+        score -= 20; reasons.append(f"-20: {dev_funded_count} wallets funded by deployer")
+
+    # Funding unknown
+    if all_funding_unknown and wallet_count >= HIGH_WALLET_THRESHOLD:
+        score -= 15; reasons.append("-15: 30+ wallets all unknown funding")
+    elif all_funding_unknown:
+        score -= 5;  reasons.append("-5: all funding unknown")
+
+    # Top holder concentration
+    if top_holders_pct is not None and top_holders_pct >= 80:
+        score -= 10; reasons.append(f"-10: top 10 hold {top_holders_pct:.0f}% (insider concentration)")
+
+    # Volume
+    if buys_h1:
+        if buys_h1 >= 500:
+            score += 5;  reasons.append(f"+5: high volume ({buys_h1} buys/h)")
+        elif buys_h1 < 100:
+            score -= 5;  reasons.append(f"-5: low volume ({buys_h1} buys/h)")
+
+    score = max(0, min(100, score))
+
+    if score >= 75:   level = "VERY HIGH"
+    elif score >= 55: level = "HIGH"
+    elif score >= 35: level = "MEDIUM"
+    else:             level = "LOW"
+
+    return level, score, reasons
+
+
+CONVICTION_EMOJI = {"VERY HIGH": "🟢🟢", "HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}
+
+
+def _fmt_conviction_block(level: str, score: int, reasons: list[str]) -> str:
+    emoji = CONVICTION_EMOJI.get(level, "⚪")
+    lines = [f"{emoji} <b>CONVICTION: {level} ({score}/100)</b>"]
+    for r in reasons[:6]:  # cap at 6 lines to keep it concise
+        lines.append(f"   {r}")
+    return "\n".join(lines)
+
+
+def enrich_cluster(token_address: str, chain_id: str, unique_buys: list[dict]) -> dict:
+    """
+    Run all Wave 2 enrichment with a hard ENRICHMENT_TIMEOUT_SECONDS timeout.
+    Returns enrichment dict: deployer_info, dormant_profiles, dev_funded.
+    Never raises — returns partial results on timeout.
+    """
+    dormant_buys = [b for b in unique_buys if b.get("wallet_type") == "dormant"]
+
+    enrichment: dict = {
+        "deployer_info": None,
+        "dormant_profiles": [],
+        "dev_funded": [],
+    }
+
+    def _get_deployer() -> dict | None:
+        return get_deployer_info(token_address, chain_id)
+
+    def _profile_dormants() -> list[dict]:
+        results = []
+        for b in dormant_buys[:MAX_WALLETS_TO_PROFILE]:
+            try:
+                p = profile_wallet(b["wallet"], chain_id)
+                results.append({"wallet": b["wallet"], **p})
+            except Exception:
+                pass
+        return results
+
+    half_t = ENRICHMENT_TIMEOUT_SECONDS / 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_deployer = ex.submit(_get_deployer)
+        f_profiles = ex.submit(_profile_dormants)
+        try:
+            enrichment["deployer_info"] = f_deployer.result(timeout=half_t)
+        except Exception as exc:
+            log.debug("[enrich] Deployer lookup timed out for %s: %s", token_address[:10], exc)
+        try:
+            enrichment["dormant_profiles"] = f_profiles.result(timeout=ENRICHMENT_TIMEOUT_SECONDS)
+        except Exception as exc:
+            log.debug("[enrich] Wallet profiling timed out for %s: %s", token_address[:10], exc)
+
+    # Dev-funded check is fast (uses cached funder data)
+    deployer_addr = (enrichment["deployer_info"] or {}).get("address")
+    if deployer_addr:
+        enrichment["dev_funded"] = check_dev_funded_wallets(
+            [b["wallet"] for b in unique_buys], deployer_addr
+        )
+
+    return enrichment
 
 
 # ---------------------------------------------------------------------------
@@ -1414,7 +1840,36 @@ def check_for_clusters(chain_id: str) -> None:
             chain_id, fresh_count, dormant_count, token_address, token_age or -1,
         )
         get_top_holder_pct(token_address, chain_id)  # populate cache before alert
-        message = build_alert(chain_id, token_address, unique_buys, token_age)
+        enrichment = enrich_cluster(token_address, chain_id, unique_buys)
+
+        # Conviction score — suppress very low conviction alerts
+        sources = [b.get("funding_source") for b in unique_buys if b.get("wallet_type") == "fresh"]
+        known_src = [s for s in sources if s and s.lower() not in ("unknown", "none")]
+        relaunch_note = check_name_relaunch(
+            (get_token_info(chain_id, token_address))["name"], token_address, chain_id
+        )
+        overlap_count = sum(1 for b in unique_buys
+                            if wallet_cluster_history.get(b["wallet"]))
+        c_level, c_score, c_reasons = calculate_conviction(
+            wallet_count=len(unique_buys),
+            dormant_profiles=enrichment["dormant_profiles"],
+            all_funding_unknown=not known_src and bool(sources),
+            funding_diversity=len(set(known_src)),
+            is_relaunch=bool(relaunch_note),
+            relaunch_attempt=len(recent_token_names.get(
+                normalize_token_name((get_token_info(chain_id, token_address))["name"]), []
+            )) + 1,
+            wallet_overlap_count=overlap_count,
+            deployer_info=enrichment["deployer_info"],
+            dev_funded_count=len(enrichment["dev_funded"]),
+            buys_h1=token_buys_h1_cache.get(token_address),
+            top_holders_pct=token_top_holders_cache.get(token_address),
+        )
+        if c_score < MIN_CONVICTION_TO_ALERT:
+            log.info("[%s] SUPPRESSED (conviction %d/100): %s", chain_id, c_score, token_address[:10])
+            return
+
+        message = build_alert(chain_id, token_address, unique_buys, token_age, enrichment, c_level, c_score, c_reasons)
         chain = CHAINS[chain_id]
         keyboard = make_alert_keyboard(
             dexscreener_url=f"https://dexscreener.com/{chain['dexscreener_network']}/{token_address}",
@@ -1758,12 +2213,19 @@ def get_solana_token_info(token_mint: str) -> dict:
     return info
 
 
-def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: float | None = None) -> str:
+def build_solana_alert(
+    token_address: str,
+    buys: list[dict],
+    token_age_hours: float | None = None,
+    enrichment: dict | None = None,
+    conviction_level: str | None = None,
+    conviction_score: int | None = None,
+    conviction_reasons: list[str] | None = None,
+) -> str:
     """Build a Telegram alert message for a Solana token cluster."""
     info = get_solana_token_info(token_address)
     token_name = info["name"]
     token_symbol = info["symbol"]
-    explorer_url = f"https://solscan.io/token/{token_address}"
 
     fresh_buys = [b for b in buys if b["wallet_type"] == "fresh"]
     dormant_buys = [b for b in buys if b["wallet_type"] == "dormant"]
@@ -1802,31 +2264,74 @@ def build_solana_alert(token_address: str, buys: list[dict], token_age_hours: fl
         summary_parts.append(f"{len(dormant_buys)} dormant 💤")
 
     extra_signals = _gather_alert_signals(token_name, token_address, "solana", buys)
+    if enrichment and enrichment.get("dev_funded"):
+        n = len(enrichment["dev_funded"])
+        pct = n / len(buys) * 100
+        extra_signals.insert(0, f"🚨 DEV FUNDED: {n}/{len(buys)} wallets funded by deployer ({pct:.0f}%)")
 
     liq_line = f"💧 Liq: {liq_str}  |  Buys/1h: {buys_1h or '?'}  |  Sells/1h: {sells or '?'}"
     if top_holders_str:
         liq_line += f"  |  {top_holders_str}"
-    lines = [
+
+    lines = []
+    if conviction_level and conviction_score is not None:
+        lines.append(_fmt_conviction_block(conviction_level, conviction_score, conviction_reasons or []))
+        lines.append("")
+
+    lines += [
         f"{tier} <b>PiggyBac Alert</b> [Solana] — {ts}",
         "",
         f"🪙 <b>{token_name}</b> ({token_symbol})" + (f" · <b>{age_str}</b>" if age_str else ""),
         f"💰 MCap: <b>{fmt_mcap(mcap)}</b>  |  Price: <b>{fmt_price(price)}</b>",
         liq_line,
+    ]
+
+    # Deployer info
+    if enrichment:
+        deployer_line = _fmt_deployer_line(enrichment.get("deployer_info"))
+        if deployer_line:
+            lines.append(deployer_line)
+
+    lines += [
         "",
         f"⚡ <b>{' + '.join(summary_parts)}</b> in {CLUSTER_TIME_WINDOW_MINUTES}min",
     ]
     for sig in extra_signals:
         if sig:
             lines.append(sig)
+
+    # Dormant wallet PnL profiles
+    if enrichment and enrichment.get("dormant_profiles"):
+        lines.append("")
+        lines.append("🏆 <b>Dormant wallet profiles:</b>")
+        for p in enrichment["dormant_profiles"]:
+            short_w = p["wallet"][:6] + "..." + p["wallet"][-4:]
+            label = SCORE_EMOJI.get(p.get("score", "unknown"), "❓")
+            analyzed = p.get("tokens_analyzed", 0)
+            winners = p.get("winners", 0)
+            detail = f"{winners}/{analyzed} winners" if analyzed > 0 else "no history"
+            lines.append(f"  😴 {short_w} — {label}: {detail}")
+
     lines.append("")
     lines.extend(wallet_lines)
 
     return "\n".join(lines)
 
 
-def build_solana_alert_with_age(token_address: str, buys: list[dict], token_age_hours: float | None) -> str:
+def build_solana_alert_with_age(
+    token_address: str,
+    buys: list[dict],
+    token_age_hours: float | None,
+    enrichment: dict | None = None,
+    conviction_level: str | None = None,
+    conviction_score: int | None = None,
+    conviction_reasons: list[str] | None = None,
+) -> str:
     """Compatibility wrapper — delegates to build_solana_alert with age argument."""
-    return build_solana_alert(token_address, buys, token_age_hours)
+    return build_solana_alert(
+        token_address, buys, token_age_hours,
+        enrichment, conviction_level, conviction_score, conviction_reasons,
+    )
 
 
 def check_solana_clusters() -> None:
@@ -1869,7 +2374,35 @@ def check_solana_clusters() -> None:
             fresh_count, dormant_count, token_address, token_age or -1,
         )
         get_top_holder_pct(token_address, "solana")  # populate cache before alert
-        message = build_solana_alert_with_age(token_address, unique_buys, token_age)
+        enrichment = enrich_cluster(token_address, "solana", unique_buys)
+
+        # Conviction score — suppress very low conviction alerts
+        sources = [b.get("funding_source") for b in unique_buys if b.get("wallet_type") == "fresh"]
+        known_src = [s for s in sources if s and s.lower() not in ("unknown", "none")]
+        relaunch_note = check_name_relaunch(
+            get_solana_token_info(token_address)["name"], token_address, "solana"
+        )
+        overlap_count = sum(1 for b in unique_buys if wallet_cluster_history.get(b["wallet"]))
+        c_level, c_score, c_reasons = calculate_conviction(
+            wallet_count=len(unique_buys),
+            dormant_profiles=enrichment["dormant_profiles"],
+            all_funding_unknown=not known_src and bool(sources),
+            funding_diversity=len(set(known_src)),
+            is_relaunch=bool(relaunch_note),
+            relaunch_attempt=len(recent_token_names.get(
+                normalize_token_name(get_solana_token_info(token_address)["name"]), []
+            )) + 1,
+            wallet_overlap_count=overlap_count,
+            deployer_info=enrichment["deployer_info"],
+            dev_funded_count=len(enrichment["dev_funded"]),
+            buys_h1=token_buys_h1_cache.get(token_address),
+            top_holders_pct=token_top_holders_cache.get(token_address),
+        )
+        if c_score < MIN_CONVICTION_TO_ALERT:
+            log.info("[solana] SUPPRESSED (conviction %d/100): %s", c_score, token_address[:10])
+            continue
+
+        message = build_solana_alert_with_age(token_address, unique_buys, token_age, enrichment, c_level, c_score, c_reasons)
         is_pump = any(b.get("dex") == "Pump.fun" for b in unique_buys)
         keyboard = make_alert_keyboard(
             dexscreener_url=f"https://dexscreener.com/solana/{token_address}",
