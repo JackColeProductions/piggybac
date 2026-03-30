@@ -128,6 +128,23 @@ ALCHEMY_KEYS = {
     "base":     ALCHEMY_BASE_KEY,
 }
 
+# Public RPC endpoints (no API key required) — used when Alchemy quota is exhausted
+PUBLIC_RPC_URLS = {
+    "base":     "https://mainnet.base.org",
+    "ethereum": "https://eth.llamarpc.com",
+}
+
+# Block explorer API config — used for wallet history + token metadata without Alchemy
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "").strip()
+EXPLORER_API_URLS = {
+    "base":     "https://api.basescan.org/api",
+    "ethereum": "https://api.etherscan.io/api",
+}
+EXPLORER_API_KEYS = {
+    "base":     API_KEY,            # BASESCAN_API_KEY
+    "ethereum": ETHERSCAN_API_KEY,
+}
+
 
 def alchemy_url(chain_id: str) -> str:
     return ALCHEMY_URLS[chain_id] + ALCHEMY_KEYS[chain_id]
@@ -464,23 +481,24 @@ NOW_TS = lambda: int(time.time())
 
 
 def alchemy_rpc(chain_id: str, method: str, params: list) -> object:
-    """JSON-RPC call to Alchemy."""
+    """JSON-RPC call — uses Alchemy if key set, otherwise public RPC fallback."""
+    url = alchemy_url(chain_id) if ALCHEMY_KEYS[chain_id] else PUBLIC_RPC_URLS[chain_id]
     try:
         r = requests.post(
-            alchemy_url(chain_id),
+            url,
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=10,
         )
         if not r.ok:
-            log.warning("[%s] Alchemy RPC %s HTTP %d: %s", chain_id, method, r.status_code, r.text[:300])
+            log.warning("[%s] EVM RPC %s HTTP %d: %s", chain_id, method, r.status_code, r.text[:300])
             return None
         data = r.json()
         if "error" in data:
-            log.warning("[%s] Alchemy RPC %s error: %s", chain_id, method, data["error"])
+            log.warning("[%s] EVM RPC %s error: %s", chain_id, method, data["error"])
             return None
         return data.get("result")
     except Exception as exc:
-        log.warning("[%s] Alchemy RPC %s failed: %s", chain_id, method, exc)
+        log.warning("[%s] EVM RPC %s failed: %s", chain_id, method, exc)
         return None
 
 
@@ -617,21 +635,81 @@ def decode_swap_log(chain_id: str, log: dict) -> tuple[str, str] | None:
     return (recipient, bought)
 
 
+def _explorer_tokentx(chain_id: str, direction: str, address: str,
+                       order: str = "asc", max_count: int = 1) -> list[dict]:
+    """
+    Basescan/Etherscan tokentx fallback for _alchemy_asset_transfers.
+    Returns transfers normalized to Alchemy-compatible format.
+    """
+    api_url = EXPLORER_API_URLS[chain_id]
+    api_key = EXPLORER_API_KEYS[chain_id]
+    sort = "asc" if order == "asc" else "desc"
+    page_size = min(max(max_count * 4, 20), 100)
+    try:
+        params: dict = {
+            "module": "account",
+            "action": "tokentx",
+            "address": address,
+            "sort": sort,
+            "page": 1,
+            "offset": page_size,
+        }
+        if api_key:
+            params["apikey"] = api_key
+        r = requests.get(api_url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") not in ("1", 1) or not data.get("result"):
+            return []
+        txs = data["result"]
+    except Exception as exc:
+        log.debug("[%s] Explorer tokentx failed for %s: %s", chain_id, address[:10], exc)
+        return []
+
+    addr_lower = address.lower()
+    is_incoming = direction == "toAddress"
+    filtered: list[dict] = []
+    for tx in txs:
+        if is_incoming and tx.get("to", "").lower() == addr_lower:
+            filtered.append(tx)
+        elif not is_incoming and tx.get("from", "").lower() == addr_lower:
+            filtered.append(tx)
+        if len(filtered) >= max_count:
+            break
+
+    # Normalize to Alchemy-compatible format so callers don't need to change
+    normalized = []
+    for tx in filtered:
+        ts_unix = int(tx.get("timeStamp") or 0)
+        ts_iso = (datetime.fromtimestamp(ts_unix, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                  if ts_unix else "")
+        normalized.append({
+            "from": tx.get("from", ""),
+            "to": tx.get("to", ""),
+            "asset": tx.get("tokenSymbol", ""),
+            "rawContract": {"address": tx.get("contractAddress", "")},
+            "metadata": {"blockTimestamp": ts_iso},
+        })
+    return normalized
+
+
 def _alchemy_asset_transfers(chain_id: str, direction: str, address: str,
                               order: str = "asc", max_count: int = 1) -> list[dict]:
     """Helper: get asset transfers in `direction` (fromAddress/toAddress) for an address."""
-    result = alchemy_rpc(chain_id, "alchemy_getAssetTransfers", [{
-        direction: address,
-        "fromBlock": "0x0",
-        "toBlock": "latest",
-        "category": ["external", "erc20"],
-        "withMetadata": True,
-        "maxCount": hex(max_count),
-        "order": order,
-    }])
-    if result and "transfers" in result:
-        return result["transfers"]
-    return []
+    if ALCHEMY_KEYS[chain_id]:
+        result = alchemy_rpc(chain_id, "alchemy_getAssetTransfers", [{
+            direction: address,
+            "fromBlock": "0x0",
+            "toBlock": "latest",
+            "category": ["external", "erc20"],
+            "withMetadata": True,
+            "maxCount": hex(max_count),
+            "order": order,
+        }])
+        if result and "transfers" in result:
+            return result["transfers"]
+        return []
+    return _explorer_tokentx(chain_id, direction, address, order, max_count)
 
 
 # Negative wallet cache — wallets confirmed not fresh/dormant in this session.
@@ -720,20 +798,66 @@ def get_wallet_funding_source(chain_id: str, address: str) -> str | None:
     return None
 
 
+def _decode_abi_string(hex_result: str) -> str:
+    """Decode ABI-encoded string returned by eth_call for name()/symbol()."""
+    try:
+        if not hex_result or hex_result in ("0x", "0x0"):
+            return ""
+        data = bytes.fromhex(hex_result[2:])
+        if len(data) < 64:
+            # Short response — might be bytes32 fixed string
+            return data.rstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+        offset = int.from_bytes(data[0:32], "big")
+        length = int.from_bytes(data[offset:offset + 32], "big")
+        return data[offset + 32: offset + 32 + length].decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
 def get_token_info(chain_id: str, token_address: str) -> dict:
-    """Fetch ERC-20 token name/symbol via Alchemy alchemy_getTokenMetadata. Cached."""
+    """Fetch ERC-20 token name/symbol. Uses Alchemy if key set, else Basescan/eth_call."""
     cache = token_info_cache[chain_id]
     if token_address in cache:
         return cache[token_address]
 
-    result = alchemy_rpc(chain_id, "alchemy_getTokenMetadata", [token_address])
-    if result:
-        name = result.get("name") or "Unknown"
-        symbol = result.get("symbol") or "???"
-        info = {"name": name, "symbol": symbol}
-    else:
-        info = {"name": "Unknown", "symbol": "???"}
+    name: str | None = None
+    symbol: str | None = None
 
+    if ALCHEMY_KEYS[chain_id]:
+        result = alchemy_rpc(chain_id, "alchemy_getTokenMetadata", [token_address])
+        if result:
+            name = result.get("name") or None
+            symbol = result.get("symbol") or None
+    else:
+        # Try Basescan/Etherscan tokeninfo first
+        try:
+            params: dict = {
+                "module": "token", "action": "tokeninfo",
+                "contractaddress": token_address,
+            }
+            if EXPLORER_API_KEYS[chain_id]:
+                params["apikey"] = EXPLORER_API_KEYS[chain_id]
+            r = requests.get(EXPLORER_API_URLS[chain_id], params=params, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") == "1" and data.get("result"):
+                item = data["result"][0] if isinstance(data["result"], list) else data["result"]
+                name = item.get("tokenName") or item.get("name") or None
+                symbol = item.get("symbol") or None
+        except Exception as exc:
+            log.debug("[%s] Explorer tokeninfo failed for %s: %s", chain_id, token_address[:10], exc)
+
+    # Final fallback: eth_call to ERC-20 name() and symbol()
+    if not name:
+        name = _decode_abi_string(
+            alchemy_rpc(chain_id, "eth_call", [{"to": token_address, "data": "0x06fdde03"}, "latest"]) or ""
+        ) or None
+    if not symbol:
+        symbol = _decode_abi_string(
+            alchemy_rpc(chain_id, "eth_call", [{"to": token_address, "data": "0x95d89b41"}, "latest"]) or ""
+        ) or None
+
+    info = {"name": name or "Unknown", "symbol": symbol or "???"}
     cache[token_address] = info
     return info
 
@@ -2625,19 +2749,20 @@ def main() -> None:
     threads.append(t)
     log.info("[review] 24h performance review scheduler started")
 
-    # Start EVM chain scanners (Base + Ethereum) — one thread per chain if key is set
+    # Start EVM chain scanners (Base + Ethereum) — Alchemy preferred, public RPC fallback
     evm_started = 0
     for chain_id in CHAINS:
-        if not ALCHEMY_KEYS[chain_id]:
-            log.warning("[%s] ALCHEMY key not set — skipping", CHAINS[chain_id]["name"])
-            continue
+        chain_name = CHAINS[chain_id]["name"]
+        if ALCHEMY_KEYS[chain_id]:
+            log.info("[%s] Using Alchemy RPC", chain_name)
+        else:
+            log.info("[%s] No Alchemy key — using public RPC (%s) + Basescan/Etherscan API",
+                     chain_name, PUBLIC_RPC_URLS[chain_id])
         t = threading.Thread(target=scan_chain, args=(chain_id,), daemon=True)
         t.start()
         threads.append(t)
         evm_started += 1
-        time.sleep(2)  # stagger startup to avoid API rate limit spike
-    if not evm_started:
-        log.warning("No Alchemy EVM keys set — skipping EVM chains (set ALCHEMY_ETH_API_KEY / ALCHEMY_BASE_API_KEY)")
+        time.sleep(2)  # stagger startup to avoid rate limit spike
 
     # Start Solana scanner
     if HELIUS_API_KEY:
@@ -2649,7 +2774,7 @@ def main() -> None:
         log.warning("HELIUS_API_KEY not set — skipping Solana")
 
     if not threads:
-        log.error("No API keys configured. Set ALCHEMY_ETH_API_KEY / ALCHEMY_BASE_API_KEY and/or HELIUS_API_KEY.")
+        log.error("No scanners started. Set HELIUS_API_KEY for Solana. EVM chains use public RPCs by default.")
         return
 
     try:
